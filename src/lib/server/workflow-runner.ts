@@ -26,6 +26,7 @@ import { slugifyBranch } from './branch-core';
 import { lastPrLink } from '$lib/pr';
 import { singleIssueTitle } from '$lib/issues';
 import { EFFORT_LEVELS } from '$lib/effort';
+import { DEFAULT_CLAUDE_PERMISSION_MODE } from '$lib/start-defaults-core';
 import { AGENT_KINDS, type DeckSession, type Project, type SessionIssue } from '$lib/types';
 import * as core from './workflow-core';
 import * as store from './workflow-store';
@@ -165,13 +166,25 @@ function phaseTitle(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit): st
 	return `${run.title} · ${step.label}${visit.visit > 1 ? ` ${visit.visit}` : ''}`;
 }
 
+// Review only reads code and runs no tests, so the default mode and the allow list serve it.
+const UNATTENDED_ROLES = new Set<WorkflowStep['role']>(['implement', 'fix', 'arbiter', 'closer', 'pr']);
+
 function sessionBody(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit): Record<string, unknown> {
 	const issue = run.issue ? { issue: run.issue } : {};
 	// A review run's session carries its PR, which is what the automatic review
 	// cap and the per-PR dedupe count.
 	const pr = step.role === 'pr-review' && run.pr ? { pr: run.pr } : {};
+	const agent = agentFields(projectOf(run), visit.agent ?? {});
+	// Nobody is there to answer a permission prompt in a run; in the CLI default mode
+	// every command outside the allow list is refused and retried. The dev phases act
+	// on an issue the owner picked, so they skip prompts like a New Session modal
+	// session does. Phases that read other people's text (a PR under review, reviewer
+	// comments) keep the default mode: that text could carry injected instructions.
+	const trusted = agent.kind === 'claude' && UNATTENDED_ROLES.has(step.role);
+	const permission = trusted ? { permissionMode: DEFAULT_CLAUDE_PERMISSION_MODE } : {};
 	return {
-		...agentFields(projectOf(run), visit.agent ?? {}),
+		...agent,
+		...permission,
 		cwd: run.cwd,
 		title: phaseTitle(run, step, visit),
 		...issue,
@@ -179,14 +192,17 @@ function sessionBody(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit): R
 	};
 }
 
-// The issue's own text for the phases that act on it. deck has the credentials
+// The issue's own text for the phases that act on it or check against it. deck has the credentials
 // and the issue already, so fetching here costs one request instead of a tool
 // call and a few thousand tokens in every phase that would otherwise go and
 // read it. Best effort: a failure comes back as a warning the prompt shows.
 async function issueContextFor(run: WorkflowRun, step: WorkflowStep): Promise<core.PromptContext> {
-	if (step.role !== 'implement' || !run.issue) return {};
+	// Review and the PR phase check the change against the issue, so they get it too.
+	if (!['implement', 'review', 'pr'].includes(step.role) || !run.issue) return {};
 	const picked = { issue: run.issue, sourceId: run.issue.sourceId ?? '' };
-	return { issue: await issuePromptContext(run.cwd, [picked]) };
+	const issue = await issuePromptContext(run.cwd, [picked]);
+	// Comments can come from anyone who can comment; only implement, as before, gets them.
+	return { issue: step.role === 'implement' ? issue : { ...issue, issueComments: '' } };
 }
 
 async function startSkill(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit, epoch: number): Promise<void> {

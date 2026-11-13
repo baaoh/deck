@@ -421,11 +421,11 @@ describe('take over and resume', () => {
 		expect(promptOf(0)).toContain('linear source has no key');
 	});
 
-	it('leaves the review phase without an issue block', async () => {
+	it('hands the review phase the issue too, so it does not fetch it again', async () => {
 		fake.issueContext = { issueTitle: 'T', issueBody: 'B', issueComments: '', warnings: [] };
 		const run = await start();
 		await finishTurn(run); // implement -> verify -> review
-		expect(promptOf(1)).not.toContain('Do not go and read it again.');
+		expect(promptOf(1)).toContain('Do not go and read it again.');
 	});
 
 	it('cancels for good, stopping the phase session', async () => {

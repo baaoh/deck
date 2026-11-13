@@ -735,6 +735,7 @@ function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext):
 		'You did not write this code. Do not edit anything; return findings only.',
 		REVIEW_TEST_NOTE,
 		`The change is for ${issueRef(run)}; judge it against that issue's acceptance criteria.`,
+		issueBlock(ctx, run),
 		reviewScope(run, ctx),
 		FINDINGS_CONTRACT
 	];
@@ -793,11 +794,18 @@ function closerPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 	];
 }
 
-function prPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
+// Each acceptance item is checked against the final code before the PR opens, and
+// the numbers an issue asks for are reported, so a PR never claims more than it shows.
+const ACCEPTANCE_NOTE =
+	'Before committing, check every requirement and acceptance item in the issue against the final diff. Put an "Acceptance" section in the PR body: one line per item, met or not met, with its evidence (file and line, command output, or the measured number). Include every number the issue asks to report, such as before and after timings or counts, measured on the final code. If any item is not met, do not commit and do not open the PR: list the unmet items and stop.';
+
+function prPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): string[] {
 	const reviewer = run.reviewer ? ` reviewer=${run.reviewer}` : '';
 	return [
 		skillLine(step, `${issueRef(run)} base-branch=${run.base ?? ''}${reviewer} loop=no`),
 		PHASE_NOTE,
+		issueBlock(ctx, run),
+		ACCEPTANCE_NOTE,
 		'The work in this worktree is implemented, tested, and reviewed. Run the commit and PR step only: one commit, push, open the PR with the issue linked by a closing keyword, request the reviewers. Do not run any review loop.'
 	];
 }

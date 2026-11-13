@@ -291,6 +291,13 @@ describe('advance: the dev loop', () => {
 });
 
 describe('phase prompts', () => {
+	it('has the PR phase check each acceptance item before it opens the PR', () => {
+		const run = devRun();
+		const prompt = phasePrompt(run, stepById(run, 'pr')!);
+		expect(prompt).toContain('"Acceptance" section');
+		expect(prompt).toContain('do not open the PR');
+	});
+
 	it('leaves the test suite to the verify step (#408)', () => {
 		const run = devRun();
 		expect(phasePrompt(run, stepById(run, 'implement')!)).toContain('the Tests step runs them next');
