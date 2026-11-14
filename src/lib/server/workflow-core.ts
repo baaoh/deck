@@ -687,6 +687,10 @@ const PHASE_NOTE = 'This session is one phase of a deck workflow run. Another ph
 // is not busy re-testing the same code from every phase (issue #408).
 const EDIT_TEST_NOTE =
 	'Do not run the full test suite or a whole backend or frontend suite: the Tests step runs them next. To check your work, run at most a type check and the single test file you changed.';
+// Implement checks its own work once at the end, in the session that already has
+// the context: a red Tests step costs a whole Fix session that starts cold.
+const IMPLEMENT_TEST_NOTE =
+	'When the change is done, run the repo\'s fast test command once through test-slot (`npm test` when its script already uses test-slot, otherwise `test-slot npm test`) and fix what fails in this session. Never run the full suite (`test:full`) or a whole backend or frontend suite; the Tests step runs next.';
 const REVIEW_TEST_NOTE =
 	'Run no tests: the Tests step already ran them and they passed. Do not start background jobs, and never end your turn while waiting on one.';
 
@@ -711,7 +715,7 @@ function implementPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContex
 		issue
 			? 'Run the skill as far as writing tests and no further: implement what the issue above asks for and add tests.'
 			: 'Run the skill as far as writing tests and no further: read the issue, implement, and add tests.',
-		EDIT_TEST_NOTE,
+		IMPLEMENT_TEST_NOTE,
 		'You are already on the run\'s branch and worktree; do not create another. Do not commit, do not run the review loop, and do not open a PR.'
 	];
 }

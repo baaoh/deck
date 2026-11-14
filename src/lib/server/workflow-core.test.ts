@@ -300,7 +300,7 @@ describe('phase prompts', () => {
 
 	it('leaves the test suite to the verify step (#408)', () => {
 		const run = devRun();
-		expect(phasePrompt(run, stepById(run, 'implement')!)).toContain('the Tests step runs them next');
+		expect(phasePrompt(run, stepById(run, 'implement')!)).toContain('run the repo\'s fast test command once');
 		toReview(run);
 		expect(phasePrompt(run, stepById(run, 'review')!)).toContain('Run no tests');
 		step(run, review([blocker()]));
