@@ -12,7 +12,7 @@ vi.mock('./confine', () => ({
 	confineRelative: (root: string, rel: string) => path.join(root, rel)
 }));
 
-const { deltaBetween, pushState, runVerify, snapshotTree, syncPullWorktree, toplevel } = await import('./workflow-exec');
+const { baseTree, deltaBetween, pushState, runVerify, snapshotTree, syncPullWorktree, toplevel } = await import('./workflow-exec');
 
 const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-exec-'));
 const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' }).trim();
@@ -46,6 +46,30 @@ describe('snapshotTree and deltaBetween', () => {
 	it('finds the worktree root from a subdirectory', async () => {
 		fs.mkdirSync(path.join(repo, 'sub'), { recursive: true });
 		expect(await toplevel(path.join(repo, 'sub'))).toBe(fs.realpathSync(repo));
+	});
+});
+
+describe('baseTree', () => {
+	it('reads the tree the branch forked from, and null for a base that is not there', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-base-'));
+		const at = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
+		try {
+			at('init', '-q', '-b', 'main');
+			at('config', 'user.email', 'test@example.com');
+			at('config', 'user.name', 'test');
+			fs.writeFileSync(path.join(dir, 'a.ts'), 'one\n');
+			at('add', '-A');
+			at('commit', '-qm', 'base');
+			const forkTree = at('rev-parse', 'HEAD^{tree}');
+			at('checkout', '-qb', 'feature');
+			expect(await baseTree(dir, 'main')).toBe(forkTree);
+			expect(await snapshotTree(dir)).toBe(forkTree);
+			fs.writeFileSync(path.join(dir, 'a.ts'), 'two\n');
+			expect(await snapshotTree(dir)).not.toBe(forkTree);
+			expect(await baseTree(dir, 'nope')).toBeNull();
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

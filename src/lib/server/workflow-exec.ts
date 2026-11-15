@@ -46,6 +46,21 @@ export async function snapshotTree(cwd: string): Promise<string> {
 	}
 }
 
+// The tree of the commit the branch forked from `base` at, null when that
+// can't be read (no base, or a base that exists neither locally nor on origin).
+export async function baseTree(cwd: string, base: string | undefined): Promise<string | null> {
+	const refs = base && isFlagSafe(base) ? [base, `origin/${base}`] : ['origin/HEAD'];
+	for (const ref of refs) {
+		try {
+			const fork = await git(cwd, ['merge-base', 'HEAD', ref]);
+			return await git(cwd, ['rev-parse', `${fork}^{tree}`]);
+		} catch {
+			// try the next ref
+		}
+	}
+	return null;
+}
+
 // The ranges that changed between two snapshots.
 export async function deltaBetween(cwd: string, from: string, to: string): Promise<string[]> {
 	return deltaRanges(await git(cwd, ['diff', '-U0', from, to]));

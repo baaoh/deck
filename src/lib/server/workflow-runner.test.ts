@@ -15,6 +15,8 @@ const fake = vi.hoisted(() => ({
 	interrupted: [] as string[],
 	notified: [] as Record<string, unknown>[],
 	trees: ['t0'] as string[],
+	// The base branch's tree at the fork point; null when it can't be read.
+	baseTree: 'tbase' as string | null,
 	deltas: [] as [string, string][],
 	verifyCode: 0,
 	// Whether fetchPullRef freshly fetched pr/<n>, and the PR checkouts the runner refreshed.
@@ -101,6 +103,7 @@ vi.mock('./confine', () => ({
 }));
 vi.mock('./workflow-exec', () => ({
 	snapshotTree: async () => fake.trees.at(-1),
+	baseTree: async () => fake.baseTree,
 	deltaBetween: async (_cwd: string, from: string, to: string) => {
 		fake.deltas.push([from, to]);
 		return [`src/hand.ts:L1-3`];
@@ -217,6 +220,7 @@ beforeEach(() => {
 	fake.interrupted = [];
 	fake.notified = [];
 	fake.trees = ['t0'];
+	fake.baseTree = 'tbase';
 	fake.deltas = [];
 	fake.verifyCode = 0;
 	fake.prRefCreated = true;
@@ -297,6 +301,38 @@ describe('a dev run end to end', () => {
 		expect(run.phase).toBe('review');
 		await finishTurn(run, 'still prose');
 		expect(run.status).toBe('blocked');
+	});
+});
+
+describe('no review of an unchanged tree', () => {
+	it('blocks when implement left the tree at the base, without starting a reviewer', async () => {
+		fake.baseTree = 't0';
+		const run = await start();
+		await finishTurn(run); // implement -> verify -> review: nothing changed
+		expect(run.status).toBe('blocked');
+		expect(run.block).toMatchObject({ step: 'review', question: expect.stringContaining('Implement produced no changes') });
+		expect(fake.created).toHaveLength(1);
+	});
+
+	it('blocks when the fix changed nothing since the last review', async () => {
+		const run = await start();
+		await finishTurn(run);
+		await finishTurn(run, findings(1)); // round 1 at t0 -> fix
+		await finishTurn(run); // the fix leaves t0 as it was
+		expect(run.status).toBe('blocked');
+		expect(run.block?.question).toContain('The fix changed nothing');
+		expect(fake.created).toHaveLength(3);
+	});
+
+	it('reviews again once the fix changed the tree', async () => {
+		const run = await start();
+		await finishTurn(run);
+		await finishTurn(run, findings(1));
+		fake.trees.push('t1');
+		await finishTurn(run);
+		expect(run.status).toBe('running');
+		expect(run.phase).toBe('review');
+		expect(fake.created).toHaveLength(4);
 	});
 });
 
@@ -491,8 +527,8 @@ describe('restart recovery', () => {
 		const run = await start();
 		await finishTurn(run);
 		await finishTurn(run, findings(1)); // round 1 done at t0 -> fix
-		await finishTurn(run); // fix -> verify -> review round 2
 		fake.trees.push('t1');
+		await finishTurn(run); // fix -> verify -> review round 2
 		expect(run.phase).toBe('review');
 		const before = fake.created.length;
 		runner.recoverRuns();

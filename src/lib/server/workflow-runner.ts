@@ -156,9 +156,12 @@ async function trackedVerify(run: WorkflowRun, command: string): Promise<{ code:
 
 // A review round's scope: everything the tree changed since the last round saw
 // it, hand edits included, from two snapshots rather than the last commit.
-async function reviewContext(run: WorkflowRun, visit: PhaseVisit): Promise<core.PromptContext> {
-	visit.tree = await wexec.snapshotTree(run.cwd);
-	const delta = run.reviewTree && run.round > 0 ? await wexec.deltaBetween(run.cwd, run.reviewTree, visit.tree) : undefined;
+// `unchanged` says why there is nothing to review, so no session is started.
+async function reviewContext(run: WorkflowRun, visit: PhaseVisit): Promise<core.PromptContext & { unchanged?: string }> {
+	const tree = (visit.tree = await wexec.snapshotTree(run.cwd));
+	const unchanged = core.unchangedReviewReason(run, tree, await wexec.baseTree(run.cwd, run.base));
+	if (unchanged) return { unchanged };
+	const delta = run.reviewTree && run.round > 0 ? await wexec.deltaBetween(run.cwd, run.reviewTree, tree) : undefined;
 	return { delta };
 }
 
@@ -206,8 +209,9 @@ async function issueContextFor(run: WorkflowRun, step: WorkflowStep): Promise<co
 }
 
 async function startSkill(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit, epoch: number): Promise<void> {
-	const ctx = step.role === 'review' ? await reviewContext(run, visit) : {};
+	const { unchanged, ...ctx } = step.role === 'review' ? await reviewContext(run, visit) : {};
 	if (stale(run, epoch)) return;
+	if (unchanged) return finish(run, epoch, { pass: false, block: { question: unchanged } });
 	// Started beside the spawn, not before it: only the prompt needs the issue
 	// text, so the session create hides the fetch's latency, and a control
 	// landing mid-spawn still sees the same ordering it always did.

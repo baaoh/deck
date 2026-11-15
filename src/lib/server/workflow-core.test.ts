@@ -22,6 +22,7 @@ import {
 	resolveWorkflows,
 	reviewedAtHead,
 	runDigest,
+	unchangedReviewReason,
 	stepById,
 	type GateResult,
 	type PrReviewView
@@ -347,6 +348,40 @@ describe('phase prompts', () => {
 	it('invokes the skill named by the step', () => {
 		const run = devRun();
 		expect(phasePrompt(run, stepById(run, 'implement')!).startsWith('/dev-workflow https://github.com/acme/web/issues/1')).toBe(true);
+	});
+});
+
+describe('unchangedReviewReason', () => {
+	it('stops a review of a tree that matches the base', () => {
+		const run = devRun();
+		expect(unchangedReviewReason(run, 't0', 't0')).toContain('Implement produced no changes');
+		expect(unchangedReviewReason(run, 't1', 't0')).toBeNull();
+		expect(unchangedReviewReason(run, 't1', null)).toBeNull();
+	});
+
+	it('stops a review after a fix that left the reviewed tree as it was', () => {
+		const run = devRun();
+		run.reviewTree = 't1';
+		for (const s of ['review', 'fix', 'verify', 'review']) beginVisit(run, s, NOW);
+		expect(unchangedReviewReason(run, 't1', 't0')).toContain('The fix changed nothing');
+		expect(unchangedReviewReason(run, 't2', 't0')).toBeNull();
+	});
+
+	it('lets a review resumed after its own block look again', () => {
+		const run = devRun();
+		run.reviewTree = 't1';
+		for (const s of ['review', 'fix', 'verify', 'review', 'review']) beginVisit(run, s, NOW);
+		expect(unchangedReviewReason(run, 't1', 't0')).toBeNull();
+	});
+});
+
+describe('advance: a block result', () => {
+	it('blocks the run on the step without a retry', () => {
+		const run = devRun();
+		const effect = advance(run, { pass: false, block: { question: 'stop here', kind: 'issue-size' } }, NOW);
+		expect(effect).toEqual({ type: 'block' });
+		expect(run.block).toMatchObject({ step: 'implement', question: 'stop here', kind: 'issue-size' });
+		expect(run.visits[0]).toMatchObject({ result: 'fail', detail: 'stop here' });
 	});
 });
 

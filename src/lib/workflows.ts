@@ -155,7 +155,12 @@ export interface RunBlock {
 	at: number;
 	by: DecisionBy;
 	step: string;
+	// Set when resuming from this block means something other than re-running
+	// the step: see the resume handler in workflow-runner.ts.
+	kind?: RunBlockKind;
 }
+
+export type RunBlockKind = 'issue-size' | 'closer-dismissed';
 
 // The intent note left by whoever was driving a phase, stamped with the
 // working-tree snapshot it was written against so a stale one shows as stale.

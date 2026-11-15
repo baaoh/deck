@@ -18,6 +18,7 @@ import {
 	type Finding,
 	type PhaseStatus,
 	type PhaseVisit,
+	type RunBlockKind,
 	type RunDigest,
 	type RunPhaseDigest,
 	type RunPr,
@@ -443,6 +444,8 @@ export interface GateResult {
 	structured?: Structured;
 	// A verify step's output, handed to the fix phase when it is red.
 	output?: string;
+	// The step found a reason to stop for a person: no retry, no failure path.
+	block?: { question: string; kind?: RunBlockKind };
 }
 
 // What the runner must do next.
@@ -454,9 +457,16 @@ function decide(run: WorkflowRun, step: string, action: string, reason: string, 
 	run.decisions.push({ at: now, by: 'engine', step, action, reason });
 }
 
-export function blockRun(run: WorkflowRun, step: string, question: string, now: number, by: 'engine' | 'overseer' | 'human' = 'engine'): Effect {
+export function blockRun(
+	run: WorkflowRun,
+	step: string,
+	question: string,
+	now: number,
+	by: 'engine' | 'overseer' | 'human' = 'engine',
+	kind?: RunBlockKind
+): Effect {
 	run.status = 'blocked';
-	run.block = { question, at: now, by, step };
+	run.block = { question, at: now, by, step, ...(kind ? { kind } : {}) };
 	run.updatedAt = now;
 	return { type: 'block' };
 }
@@ -611,7 +621,7 @@ function closeVisit(run: WorkflowRun, result: GateResult, now: number): void {
 	if (!visit || visit.endedAt) return;
 	visit.endedAt = now;
 	visit.result = result.error ? 'error' : result.skipped ? 'skipped' : result.pass ? 'pass' : 'fail';
-	visit.detail = result.error ?? result.detail;
+	visit.detail = result.error ?? result.block?.question ?? result.detail;
 }
 
 // Record a finished visit and decide what happens next. Mutates `run`.
@@ -620,9 +630,32 @@ export function advance(run: WorkflowRun, result: GateResult, now: number): Effe
 	if (!step) return blockRun(run, run.phase, `The workflow has no step "${run.phase}".`, now);
 	closeVisit(run, result, now);
 	run.updatedAt = now;
+	if (result.block) return blockRun(run, step.id, result.block.question, now, 'engine', result.block.kind);
 	if (result.error) return onError(run, step, result.error, now);
 	run.failures[step.id] = 0;
 	return (HANDLERS[step.role] ?? passOrFail)(run, step, result, now);
+}
+
+// ---- Before a review round ----
+
+// The visit before the current one, skipping verify, came from the fix step.
+function cameFromFix(run: WorkflowRun): boolean {
+	const earlier = run.visits
+		.slice(0, -1)
+		.reverse()
+		.find((v) => stepById(run, v.step)?.role !== 'verify');
+	return !!earlier && stepById(run, earlier.step)?.role === 'fix';
+}
+
+// Why a review round about to start would examine nothing new, or null when it
+// has something to read. `baseTree` is the base branch's tree at the merge
+// base, null when it could not be read.
+export function unchangedReviewReason(run: WorkflowRun, tree: string, baseTree: string | null): string | null {
+	if (baseTree && tree === baseTree) return 'Implement produced no changes: the worktree matches the base branch, so there is nothing to review.';
+	if (run.reviewTree && tree === run.reviewTree && cameFromFix(run)) {
+		return 'The fix changed nothing: the worktree is the same tree the last review examined.';
+	}
+	return null;
 }
 
 // ---- Phase prompts ----
