@@ -227,6 +227,11 @@ async function startSkill(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisi
 	// text, so the session create hides the fetch's latency, and a control
 	// landing mid-spawn still sees the same ordering it always did.
 	const issue = issueContextFor(run, step);
+	if (step.role === 'implement' && !run.issueSizeOverride) {
+		const problem = core.issueSizeProblem((await issue.catch(() => ({}) as core.PromptContext)).issue);
+		if (stale(run, epoch)) return;
+		if (problem) return finish(run, epoch, { pass: false, block: { question: problem, kind: 'issue-size' } });
+	}
 	// Created idle and sent its prompt here, after the stale check, rather than
 	// by the create pipeline: a pause or cancel landing mid-spawn then leaves an
 	// idle session, never one that starts editing the worktree untracked.
@@ -728,6 +733,8 @@ const resume: Handler = async (run, body, actor) => {
 	const phase = str(body.phase) || run.phase;
 	if (!core.stepById(run, phase)) error(400, `the workflow has no step "${phase}"`);
 	record(run, actor, 'resume', phase);
+	// Resuming the size block is the owner saying run it anyway, for good.
+	if (run.status === 'blocked' && run.block?.kind === 'issue-size') run.issueSizeOverride = true;
 	const paused = pausedEndFor(run, phase);
 	if (paused) return settlePausedEnd(run, paused);
 	closeOpen(run, 'resumed elsewhere');

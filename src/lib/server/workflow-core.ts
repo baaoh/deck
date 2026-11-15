@@ -699,6 +699,47 @@ export function unchangedReviewReason(run: WorkflowRun, tree: string, baseTree: 
 	return null;
 }
 
+// ---- Before implement: is the issue one run's worth? ----
+
+const ISSUE_ITEM_CAP = 10;
+const ISSUE_BODY_CAP = 12_000;
+
+const MD_HEADING = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/;
+const BOLD_LINE = /^\s*(\*\*|__)(.+?)\1\s*:?\s*$/;
+const ASK_HEADING = /requirement|acceptance|\bask\b|\bscope\b|what to do/i;
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
+
+function headingText(line: string): string | null {
+	return MD_HEADING.exec(line)?.[1] ?? BOLD_LINE.exec(line)?.[2] ?? null;
+}
+
+// List items under headings that read as what the issue asks for
+// (Requirements, Acceptance, Ask, Scope, What to do; "Out of scope" excluded).
+export function issueAskItems(body: string): number {
+	let counting = false;
+	let items = 0;
+	for (const line of body.split('\n')) {
+		const heading = headingText(line);
+		if (heading !== null) counting = ASK_HEADING.test(heading) && !/out of scope/i.test(heading);
+		else if (counting && LIST_ITEM.test(line)) items += 1;
+	}
+	return items;
+}
+
+// Why the issue looks too big for one run, or null. Only the issue's own text
+// counts: a run with none is never stopped here.
+export function issueSizeProblem(issue: IssueText | undefined): string | null {
+	const body = issue?.issueBody ?? '';
+	if (!body.trim()) return null;
+	const items = issueAskItems(body);
+	if (items <= ISSUE_ITEM_CAP && body.length <= ISSUE_BODY_CAP) return null;
+	return [
+		`This issue looks too big for one run: ${items} list items under requirement headings (limit ${ISSUE_ITEM_CAP}),`,
+		`${body.length} characters in its body (limit ${ISSUE_BODY_CAP}).`,
+		'Split this issue, or resume to run it anyway.'
+	].join(' ');
+}
+
 // ---- Phase prompts ----
 
 export interface PromptContext {

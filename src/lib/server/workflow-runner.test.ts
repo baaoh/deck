@@ -391,6 +391,39 @@ describe('infrastructure test failures', () => {
 	});
 });
 
+describe('an oversized issue', () => {
+	const bigBody = ['## Requirements', ...Array.from({ length: 11 }, (_, i) => `- item ${i}`)].join('\n');
+
+	it('blocks before implement starts, and runs it anyway once resumed', async () => {
+		fake.issueContext = { issueTitle: 'Everything', issueBody: bigBody };
+		const run = await start();
+		expect(run.status).toBe('blocked');
+		expect(run.block).toMatchObject({ step: 'implement', kind: 'issue-size' });
+		expect(run.block?.question).toContain('11 list items');
+		expect(run.block?.question).toContain('Split this issue, or resume to run it anyway');
+		expect(fake.created).toHaveLength(0);
+
+		await runner.runAction(run.id, 'resume', {});
+		await settle();
+		expect(run.issueSizeOverride).toBe(true);
+		expect(run.status).toBe('running');
+		expect(fake.created).toHaveLength(1);
+		expect(promptOf(0)).toContain('item 10');
+
+		// The override holds for the rest of the run: a retried implement is not stopped again.
+		await runner.runAction(run.id, 'retry', {});
+		await settle();
+		expect(run.status).toBe('running');
+		expect(fake.created).toHaveLength(2);
+	});
+
+	it('leaves a run without issue text alone', async () => {
+		const run = await start();
+		expect(run.status).toBe('running');
+		expect(fake.created).toHaveLength(1);
+	});
+});
+
 describe('one run per worktree', () => {
 	it('refuses a second run in a worktree that has an active one', async () => {
 		await start();

@@ -24,6 +24,8 @@ import {
 	runDigest,
 	unchangedReviewReason,
 	usageLimitHit,
+	issueAskItems,
+	issueSizeProblem,
 	verifyInfraFailure,
 	stepById,
 	type GateResult,
@@ -390,6 +392,33 @@ describe('verifyInfraFailure', () => {
 		expect(verifyInfraFailure(0, 'Killed')).toBeNull();
 		expect(verifyInfraFailure(1, 'FAIL src/a.test.ts > kills the worker')).toBeNull();
 		expect(verifyInfraFailure(2, 'error TS2322: Type is not assignable')).toBeNull();
+	});
+});
+
+describe('issue size', () => {
+	const list = (n: number, bullet = '-') => Array.from({ length: n }, (_, i) => `${bullet} item ${i}`).join('\n');
+
+	it('counts list items under requirement-like headings at any level or as a bold line', () => {
+		expect(issueAskItems(`## Requirements\n${list(3)}\n\n## Notes\n${list(5)}`)).toBe(3);
+		expect(issueAskItems(`#### acceptance criteria\n${list(2, '1.')}\n- [ ] checkbox`)).toBe(3);
+		expect(issueAskItems(`**Ask:**\n${list(2, '*')}\n__Scope__\n${list(2, '+')}`)).toBe(4);
+		expect(issueAskItems(`### What to do\n${list(2)}\n  - nested`)).toBe(3);
+		expect(issueAskItems(`## Out of scope\n${list(4)}\n## Background\n${list(4)}`)).toBe(0);
+	});
+
+	it('flags more than ten items, or a body over 12,000 characters', () => {
+		expect(issueSizeProblem({ issueBody: `## Requirements\n${list(10)}` })).toBeNull();
+		const many = issueSizeProblem({ issueBody: `## Requirements\n${list(11)}` });
+		expect(many).toContain('11 list items');
+		expect(many).toContain('Split this issue, or resume to run it anyway.');
+		const long = issueSizeProblem({ issueBody: 'x'.repeat(12_001) });
+		expect(long).toContain('0 list items');
+		expect(long).toContain('12001 characters');
+	});
+
+	it('never stops a run without issue text', () => {
+		expect(issueSizeProblem(undefined)).toBeNull();
+		expect(issueSizeProblem({ warnings: ['gh failed'] })).toBeNull();
 	});
 });
 

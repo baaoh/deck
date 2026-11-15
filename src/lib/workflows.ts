@@ -241,6 +241,8 @@ export interface WorkflowRun {
 	handoff?: RunHandoff;
 	decisions: RunDecision[];
 	error?: string;
+	// The owner resumed past the oversized-issue check: implement runs anyway.
+	issueSizeOverride?: boolean;
 	// Set while a finished run is reopened to fix its leftover findings: the
 	// commit the branch was at, so the gate can tell a new commit was pushed.
 	followUp?: { head: string };
