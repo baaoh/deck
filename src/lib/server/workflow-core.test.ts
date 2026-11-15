@@ -386,6 +386,7 @@ describe('usageLimitHit', () => {
 	});
 
 	it('leaves other failures to the normal retry', () => {
+		for (const text of ['Disk quota exceeded', 'ENOSPC: no space left on device', 'request limit reached for this file']) expect(usageLimitHit(text), text).toBe(false);
 		expect(usageLimitHit('')).toBe(false);
 		expect(usageLimitHit('codex turn failed: sandbox denied')).toBe(false);
 		expect(usageLimitHit('API Error: 500 overloaded')).toBe(false);
@@ -426,7 +427,7 @@ describe('issue size', () => {
 		expect(many).toContain('11 list items');
 		expect(many).toContain('Split this issue, or resume to run it anyway.');
 		const long = issueSizeProblem({ issueBody: 'x'.repeat(12_001) });
-		expect(long).toContain('0 list items');
+		expect(long).not.toContain('list items');
 		expect(long).toContain('12001 characters');
 	});
 

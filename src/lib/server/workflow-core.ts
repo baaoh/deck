@@ -662,7 +662,7 @@ export function advance(run: WorkflowRun, result: GateResult, now: number): Effe
 
 export const USAGE_LIMIT_BLOCK = 'agent hit its usage limit; resume when it resets';
 
-const USAGE_LIMIT = /usage limit|limit reached|hit your (?:\w+ )?limit|rate[ _-]?limit|quota|too many requests|\b429\b/i;
+const USAGE_LIMIT = /usage limit|(?:session|weekly|daily|5-hour|opus|plan) limit reached|hit your (?:\w+ )?limit|rate[ _-]?limit(?:ed| exceeded| error)|insufficient_quota|exceeded your current quota|\brate_limit(?:_error)?\b|too many requests|api error: 429|http 429|status(?: code)?:? 429/i;
 
 // Whether a turn's error text (see lastTurnErrors) says the agent ran out of its
 // account's usage or was rate limited: waiting fixes that, a retry does not.
@@ -715,13 +715,23 @@ export function unchangedReviewReason(run: WorkflowRun, tree: string, baseTree: 
 const ISSUE_ITEM_CAP = 10;
 const ISSUE_BODY_CAP = 12_000;
 
-const MD_HEADING = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/;
-const BOLD_LINE = /^\s*(\*\*|__)(.+?)\1\s*:?\s*$/;
+const MAX_SCANNED_LINE = 500;
 const ASK_HEADING = /requirement|acceptance|\bask\b|\bscope\b|what to do/i;
-const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
+const LIST_ITEM = /^(?:[-*+]|\d+[.)])\s/;
 
+// A heading's text, or null. String operations on a trimmed, length-capped line,
+// so a hostile issue body cannot make a regex backtrack.
 function headingText(line: string): string | null {
-	return MD_HEADING.exec(line)?.[1] ?? BOLD_LINE.exec(line)?.[2] ?? null;
+	const t = line.trim();
+	if (t.startsWith('#')) {
+		const text = t.replace(/^#{1,6}/, '');
+		return text !== t && text.startsWith(' ') ? text.replace(/#+$/, '').trim() : null;
+	}
+	for (const mark of ['**', '__']) {
+		const inner = t.endsWith(':') ? t.slice(0, -1).trimEnd() : t;
+		if (inner.length > 4 && inner.startsWith(mark) && inner.endsWith(mark)) return inner.slice(2, -2).trim();
+	}
+	return null;
 }
 
 // List items under headings that read as what the issue asks for
@@ -730,9 +740,10 @@ export function issueAskItems(body: string): number {
 	let counting = false;
 	let items = 0;
 	for (const line of body.split('\n')) {
+		if (line.length > MAX_SCANNED_LINE) continue;
 		const heading = headingText(line);
 		if (heading !== null) counting = ASK_HEADING.test(heading) && !/out of scope/i.test(heading);
-		else if (counting && LIST_ITEM.test(line)) items += 1;
+		else if (counting && LIST_ITEM.test(line.trimStart())) items += 1;
 	}
 	return items;
 }
@@ -742,10 +753,11 @@ export function issueAskItems(body: string): number {
 export function issueSizeProblem(issue: IssueText | undefined): string | null {
 	const body = issue?.issueBody ?? '';
 	if (!body.trim()) return null;
-	const items = issueAskItems(body);
+	// Over the body cap the issue is flagged on length alone; the scan is skipped.
+	const items = body.length > ISSUE_BODY_CAP ? 0 : issueAskItems(body);
 	if (items <= ISSUE_ITEM_CAP && body.length <= ISSUE_BODY_CAP) return null;
 	return [
-		`This issue looks too big for one run: ${items} list items under requirement headings (limit ${ISSUE_ITEM_CAP}),`,
+		body.length > ISSUE_BODY_CAP ? 'This issue looks too big for one run:' : `This issue looks too big for one run: ${items} list items under requirement headings (limit ${ISSUE_ITEM_CAP}),`,
 		`${body.length} characters in its body (limit ${ISSUE_BODY_CAP}).`,
 		'Split this issue, or resume to run it anyway.'
 	].join(' ');
