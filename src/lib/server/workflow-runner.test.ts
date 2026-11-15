@@ -455,6 +455,44 @@ describe('the review gets its diff inline', () => {
 	});
 });
 
+describe('a closer dismissal', () => {
+	async function toCloser(): Promise<WorkflowRun> {
+		const run = await start();
+		run.round = 4;
+		await finishTurn(run); // -> review round 5
+		await finishTurn(run, findings(1)); // blockers at the cap -> closer
+		expect(run.phase).toBe('closer');
+		return run;
+	}
+	const dismissed = '```json\n{"dismissed": true, "reason": "the finding misreads the contract"}\n```';
+
+	it('blocks for the owner, and resuming goes on to the PR without the blockers', async () => {
+		const run = await toCloser();
+		await finishTurn(run, dismissed);
+		expect(run.status).toBe('blocked');
+		expect(run.block?.question).toContain('the finding misreads the contract');
+		expect(fake.notified.at(-1)).toMatchObject({ reason: 'needs-you' });
+		const before = fake.created.length;
+		await runner.runAction(run.id, 'resume', {});
+		await settle();
+		expect(run.phase).toBe('pr');
+		expect(run.status).toBe('running');
+		expect(run.findings).toEqual([]);
+		expect(fake.created).toHaveLength(before + 1);
+		expect(promptOf(-1)).toMatch(/^\/dev-workflow/);
+	});
+
+	it('resumed at another step, runs that step instead', async () => {
+		const run = await toCloser();
+		await finishTurn(run, dismissed);
+		fake.trees.push('t1');
+		await runner.runAction(run.id, 'resume', { phase: 'fix' });
+		await settle();
+		expect(run.phase).toBe('fix');
+		expect(run.findings).toHaveLength(1);
+	});
+});
+
 describe('one run per worktree', () => {
 	it('refuses a second run in a worktree that has an active one', async () => {
 		await start();

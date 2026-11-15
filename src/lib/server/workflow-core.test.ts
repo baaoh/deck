@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	BUILTIN_WORKFLOWS,
+	acceptDismissal,
 	advance,
 	agentFor,
 	beginVisit,
@@ -249,16 +250,28 @@ describe('advance: the dev loop', () => {
 		expect(run.block?.question).toContain('6 review rounds');
 	});
 
-	it('records a closer that rules the blockers invalid and moves past review', () => {
+	it('stops for a person when the closer rules the blockers invalid, and goes past review once accepted', () => {
 		const run = devRun();
 		run.escalations.cap = false;
 		run.round = 4;
 		toReview(run);
 		step(run, review([blocker()]));
 		expect(run.phase).toBe('closer');
-		step(run, { pass: true, structured: { dismissed: true, reason: 'the finding misreads the contract' } });
-		expect(run.phase).toBe('pr');
-		expect(run.decisions.at(-1)).toMatchObject({ action: 'dismiss', reason: 'the finding misreads the contract' });
+		expect(step(run, { pass: true, structured: { dismissed: true, reason: 'the finding misreads the contract' } })).toEqual({ type: 'block' });
+		expect(run.block).toMatchObject({ step: 'closer', kind: 'closer-dismissed', question: expect.stringContaining('the finding misreads the contract') });
+		expect(run.findings).toHaveLength(1);
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'dismiss-proposed', reason: 'the finding misreads the contract' });
+		expect(acceptDismissal(run, NOW)).toEqual({ type: 'enter', step: 'pr' });
+		expect(run.findings).toEqual([]);
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'dismiss' });
+	});
+
+	it('carries on as before when the closer does not dismiss', () => {
+		const run = devRun();
+		run.round = 4;
+		toReview(run);
+		step(run, review([blocker()]));
+		expect(step(run, { pass: true, structured: { dismissed: false, reason: 'fixed it' } })).toEqual({ type: 'enter', step: 'verify' });
 	});
 
 	it('sends a disagreement to the arbiter once, and blocks on a second', () => {

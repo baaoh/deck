@@ -742,6 +742,11 @@ const resume: Handler = async (run, body, actor) => {
 	record(run, actor, 'resume', phase);
 	// Resuming the size block is the owner saying run it anyway, for good.
 	if (run.status === 'blocked' && run.block?.kind === 'issue-size') run.issueSizeOverride = true;
+	if (run.status === 'blocked' && run.block?.kind === 'closer-dismissed' && phase === run.phase) {
+		freshStart(run, phase);
+		run.epoch += 1;
+		return apply(run, core.acceptDismissal(run, Date.now()));
+	}
 	const paused = pausedEndFor(run, phase);
 	if (paused) return settlePausedEnd(run, paused);
 	closeOpen(run, 'resumed elsewhere');

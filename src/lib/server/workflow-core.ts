@@ -589,10 +589,21 @@ function onFix(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: nu
 }
 
 // The closer either fixed the blockers (verify, then one final review round) or
-// ruled them invalid, which is recorded and skips past review.
+// ruled them invalid. A ruling waives a review's blockers, so the owner makes
+// the call: the run blocks with the closer's reason, and resuming accepts it.
 function onCloser(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
 	if (!result.structured?.dismissed) return passOrFail(run, step, result, now);
-	decide(run, step.id, 'dismiss', result.structured.reason ?? 'The closer ruled the standing blockers invalid.', now);
+	const reason = result.structured.reason ?? 'no reason given';
+	decide(run, step.id, 'dismiss-proposed', reason, now);
+	const question = `The closer ruled the standing blockers invalid: ${reason}\nResume to accept that and open the PR, or resume at another step.`;
+	return blockRun(run, step.id, question, now, 'engine', 'closer-dismissed');
+}
+
+// The owner resumed a closer's dismissal: drop the blockers and go on past
+// review, as a dismissal did before it stopped for a person.
+export function acceptDismissal(run: WorkflowRun, now: number): Effect {
+	const step = currentStep(run)!;
+	decide(run, step.id, 'dismiss', 'The owner accepted the closer\'s dismissal of the standing blockers.', now);
 	run.findings = [];
 	const review = stepWithRole(run, 'review');
 	return goTo(run, review?.next ?? step.next, now);
