@@ -127,6 +127,17 @@ export interface Verification {
 	evidence: string;
 }
 
+export type AcceptanceStatus = 'met' | 'unmet' | 'not_verifiable';
+
+// One item of the run's acceptance checklist, read from the issue (or written
+// by implement when the issue has none), with the last status a phase gave it.
+export interface AcceptanceItem {
+	id: string;
+	text: string;
+	status?: AcceptanceStatus;
+	evidence?: string;
+}
+
 // One entry of a fix phase's report: the finding, where the change went, and
 // what shows it works.
 export interface FixReport {
@@ -190,7 +201,7 @@ export interface RunBlock {
 	kind?: RunBlockKind;
 }
 
-export type RunBlockKind = 'issue-size' | 'closer-dismissed';
+export type RunBlockKind = 'issue-size' | 'closer-dismissed' | 'acceptance-unmet';
 
 // The intent note left by whoever was driving a phase, stamped with the
 // working-tree snapshot it was written against so a stale one shows as stale.
@@ -272,6 +283,10 @@ export interface WorkflowRun {
 	error?: string;
 	// The owner resumed past the oversized-issue check: implement runs anyway.
 	issueSizeOverride?: boolean;
+	// The numbered checklist review checks and the PR gate enforces (A1, A2, ...).
+	acceptance?: AcceptanceItem[];
+	// The owner resumed past unmet acceptance items: the PR gate passes on the link.
+	acceptanceOverride?: { at: number; by: DecisionBy; ids: string[] };
 	// Set while a finished run is reopened to fix its leftover findings: the
 	// commit the branch was at, so the gate can tell a new commit was pushed.
 	followUp?: { head: string };
@@ -340,6 +355,7 @@ export interface RunDigest {
 	blockers: number;
 	findings: Finding[];
 	followUps: Finding[];
+	acceptance: AcceptanceItem[];
 	escalations: WorkflowRun['escalations'];
 	humanTouched: boolean;
 	phases: RunPhaseDigest[];

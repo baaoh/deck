@@ -15,6 +15,7 @@ import {
 	STEP_ROLES,
 	WORKFLOW_CATEGORIES,
 	type Coverage,
+	type AcceptanceItem,
 	type Finding,
 	type FixReport,
 	type Verification,
@@ -387,6 +388,33 @@ const findingSchema = z.object({
 // `not fixed`, `Not-Fixed` and `not_fixed` all read the same.
 const status = z.string().transform((s) => s.trim().toLowerCase().replace(/[\s-]+/g, '_'));
 
+// A checklist item as a phase reports it: implement writes `text`, review and
+// the PR phase give `status` and `evidence`.
+const acceptanceSchema = z.object({
+	id: z.string().transform((s) => s.trim().toUpperCase()),
+	text: optionalText,
+	status: status
+		.transform((s) => (s === 'not_met' ? 'unmet' : s))
+		.pipe(z.enum(['met', 'unmet', 'not_verifiable']))
+		.optional()
+		.catch(undefined),
+	evidence: optionalText
+});
+
+export type AcceptanceReport = z.infer<typeof acceptanceSchema>;
+
+// Each entry parsed alone, so one malformed entry drops only itself.
+function lenientArray<T extends z.ZodTypeAny>(item: T) {
+	return z
+		.array(z.unknown())
+		.transform((list) => list.flatMap((v) => {
+			const parsed = item.safeParse(v);
+			return parsed.success ? [parsed.data as z.infer<T>] : [];
+		}))
+		.optional()
+		.catch(undefined);
+}
+
 const verificationSchema = z.object({
 	id: z.string(),
 	status: status.pipe(z.enum(['fixed', 'not_fixed', 'regressed'])),
@@ -409,6 +437,7 @@ const coverageSchema = z.object({
 export interface Structured {
 	findings?: Finding[];
 	verifications?: Verification[];
+	acceptance?: AcceptanceReport[];
 	coverage?: Coverage;
 	disagreements?: string[];
 	fixes?: FixReport[];
@@ -421,15 +450,8 @@ export interface Structured {
 const structuredSchema = z
 	.object({
 		findings: z.array(findingSchema).optional(),
-		// One malformed entry drops only itself, never the findings beside it.
-		verifications: z
-			.array(z.unknown())
-			.transform((list) => list.flatMap((v) => {
-				const parsed = verificationSchema.safeParse(v);
-				return parsed.success ? [parsed.data] : [];
-			}))
-			.optional()
-			.catch(undefined),
+		verifications: lenientArray(verificationSchema),
+		acceptance: lenientArray(acceptanceSchema),
 		coverage: coverageSchema.optional(),
 		disagreements: z.array(z.string()).optional(),
 		// Never fails the block: a malformed report must not lose the disagreements beside it.
@@ -582,10 +604,80 @@ function ensureFindingIds(run: WorkflowRun): void {
 	for (const f of run.findings) if (!f.id) f.id = nextFindingId(run);
 }
 
-// The blockers a round left open, which the next round checks by id.
+// The blockers a round left open: review findings and unmet acceptance items.
 export function openFindings(run: WorkflowRun): Finding[] {
 	ensureFindingIds(run);
 	return run.findings.filter((f) => f.severity === 'blocker');
+}
+
+function isAcceptanceId(id: string | undefined): boolean {
+	return /^A\d+$/.test(id ?? '');
+}
+
+// The review findings a later round checks by id. Unmet acceptance items are
+// not among them: every round reports the whole checklist again.
+function openReviewFindings(run: WorkflowRun): Finding[] {
+	return openFindings(run).filter((f) => !isAcceptanceId(f.id));
+}
+
+// ---- The acceptance checklist ----
+
+// Take the statuses a phase reported for the run's checklist items. Unknown ids
+// are ignored; an item not reported keeps its last status.
+export function applyAcceptance(run: WorkflowRun, reported: AcceptanceReport[] | undefined): void {
+	for (const r of reported ?? []) {
+		const item = run.acceptance?.find((a) => a.id === r.id);
+		if (item && r.status) Object.assign(item, { status: r.status, evidence: r.evidence });
+	}
+}
+
+// Implement wrote the checklist the issue lacked. Renumbered, so the ids are
+// the engine's whatever the agent called them.
+function takeWrittenChecklist(run: WorkflowRun, reported: AcceptanceReport[] | undefined): void {
+	if (run.acceptance?.length) return;
+	const written = (reported ?? []).map((r) => r.text?.trim() ?? '').filter(Boolean);
+	if (written.length) run.acceptance = written.map((text, i) => ({ id: `A${i + 1}`, text }));
+}
+
+// An unmet item as a blocker the fix phase gets, under the item's own id.
+function unmetFindings(run: WorkflowRun): Finding[] {
+	return (run.acceptance ?? [])
+		.filter((a) => a.status === 'unmet')
+		.map((a) => ({
+			id: a.id,
+			file: 'acceptance',
+			severity: 'blocker',
+			defect: `Acceptance item ${a.id} is not met: ${a.text}`,
+			...(a.evidence ? { fix: a.evidence } : {})
+		}));
+}
+
+// The checklist items the PR gate would not pass: any not reported met, unless
+// the owner accepted them. Nothing to check on a run without a checklist.
+export function acceptanceGaps(run: WorkflowRun, reported: AcceptanceReport[] | undefined): { id: string; text: string; status?: string }[] {
+	if (!run.acceptance?.length || run.acceptanceOverride) return [];
+	const byId = new Map((reported ?? []).map((r) => [r.id, r.status]));
+	return run.acceptance
+		.filter((a) => byId.get(a.id) !== 'met')
+		.map((a) => ({ id: a.id, text: a.text, status: byId.get(a.id) }));
+}
+
+// Why the PR gate stops for the owner, naming the unmet items and whether a PR
+// went up regardless.
+export function acceptanceBlock(gaps: { id: string; text: string; status?: string }[], prUrl: string | null): string {
+	return [
+		'Acceptance items not met:',
+		...gaps.map((g) => `- ${g.id} (${g.status ?? 'no status reported'}): ${g.text}`),
+		prUrl ? `A PR was opened anyway: ${prUrl}` : 'No PR was opened.',
+		'Resume to accept them and go on, or resume at another step to finish them.'
+	].join('\n');
+}
+
+// The owner resumed past unmet items and the PR is linked: go on past the PR step.
+export function acceptOverride(run: WorkflowRun, now: number): Effect {
+	const step = currentStep(run)!;
+	decide(run, step.id, 'accept-unmet', `The owner accepted unmet acceptance items: ${run.acceptanceOverride?.ids.join(', ') || 'none'}.`, now);
+	return goTo(run, step.next, now);
 }
 
 // A delta entry (`src/a.ts:L4-6,L9`) as its file and line ranges.
@@ -664,16 +756,20 @@ function judgeNew(run: WorkflowRun, stepId: string, raw: Finding[], delta: strin
 // (fixed ones go into history), new ones get ids, and the round's blockers are
 // the ones still open plus the new blockers that count.
 function recordRound(run: WorkflowRun, step: WorkflowStep, structured: Structured | undefined, now: number): { blockers: number; stillOpen: string[] } {
-	const prior = run.round > 0 ? openFindings(run) : [];
+	const prior = run.round > 0 ? openReviewFindings(run) : [];
+	const wasUnmet = new Set(run.round > 0 ? openFindings(run).filter((f) => isAcceptanceId(f.id)).map((f) => f.id!) : []);
 	run.round += 1;
 	run.verifyOutput = undefined;
 	const visit = lastVisit(run);
 	run.reviewTree = visit?.tree ?? run.reviewTree;
 	const { open, fixed } = checkPrior(prior, structured?.verifications ?? []);
 	run.pastFindings = [...(run.pastFindings ?? []), ...fixed].slice(-50);
-	run.findings = [...open, ...judgeNew(run, step.id, structured?.findings ?? [], visit?.delta, now)];
+	applyAcceptance(run, structured?.acceptance);
+	const unmet = unmetFindings(run);
+	run.findings = [...open, ...unmet, ...judgeNew(run, step.id, structured?.findings ?? [], visit?.delta, now)];
 	run.coverage = structured?.coverage;
-	return { blockers: blockerCount(run.findings), stillOpen: open.map((f) => f.id!) };
+	const stillOpen = [...open.map((f) => f.id!), ...unmet.map((f) => f.id!).filter((id) => wasUnmet.has(id))];
+	return { blockers: blockerCount(run.findings), stillOpen };
 }
 
 // Two or more blockers in round 1 prove the task needed the stronger implementer.
@@ -780,7 +876,13 @@ function onFeedback(run: WorkflowRun, step: WorkflowStep, result: GateResult, no
 	return { type: 'wait' };
 }
 
+function onImplement(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
+	takeWrittenChecklist(run, result.structured?.acceptance);
+	return passOrFail(run, step, result, now);
+}
+
 const HANDLERS: Partial<Record<WorkflowStep['role'], typeof passOrFail>> = {
+	implement: onImplement,
 	verify: onVerify,
 	review: onReview,
 	fix: onFix,
@@ -894,18 +996,32 @@ function headingText(line: string): string | null {
 	return null;
 }
 
-// List items under headings that read as what the issue asks for
-// (Requirements, Acceptance, Ask, Scope, What to do; "Out of scope" excluded).
-export function issueAskItems(body: string): number {
+// The list items under headings that read as what the issue asks for
+// (Requirements, Acceptance, Ask, Scope, What to do; "Out of scope" excluded),
+// as text without their list or checkbox marker.
+function issueAskList(body: string): string[] {
 	let counting = false;
-	let items = 0;
+	const items: string[] = [];
 	for (const line of body.split('\n')) {
 		if (line.length > MAX_SCANNED_LINE) continue;
 		const heading = headingText(line);
+		const t = line.trimStart();
 		if (heading !== null) counting = ASK_HEADING.test(heading) && !/out of scope/i.test(heading);
-		else if (counting && LIST_ITEM.test(line.trimStart())) items += 1;
+		else if (counting && LIST_ITEM.test(t)) items.push(t.replace(LIST_ITEM, '').replace(/^\[[ xX]\]\s*/, '').trim());
 	}
 	return items;
+}
+
+export function issueAskItems(body: string): number {
+	return issueAskList(body).length;
+}
+
+// The run's acceptance checklist from the issue's own text, numbered A1, A2, ...
+// Empty when the issue has no such list (implement then writes one).
+export function acceptanceFromIssue(issue: IssueText | undefined): AcceptanceItem[] {
+	return issueAskList(issue?.issueBody ?? '')
+		.filter(Boolean)
+		.map((text, i) => ({ id: `A${i + 1}`, text }));
 }
 
 // Why the issue looks too big for one run, or null. Only the issue's own text
@@ -977,11 +1093,13 @@ function issueBlock(ctx: PromptContext, run: WorkflowRun): string {
 
 // What a review round returns. From round 2 on it also checks each finding the
 // last round left open, by id.
-function findingsContract(later: boolean): string {
+function findingsContract(later: boolean, checklist: boolean): string {
 	const verifications = '"verifications":[{"id":"F1","status":"fixed|not_fixed|regressed","evidence":"what in the code shows it"}],\n ';
+	const acceptance = ' "acceptance":[{"id":"A1","status":"met|unmet|not_verifiable","evidence":"file:line, test, or why it cannot be checked"}],';
 	return [
 		'End your reply with one fenced ```json block, exactly this shape, so the workflow can read the verdict:',
 		`{${later ? verifications : ''}"findings":[{"file":"path","line":1,"severity":"blocker|nit","defect":"...","scenario":"input or steps, and the wrong result","fix":"...","keep":"..."}],`,
+		...(checklist ? [acceptance] : []),
 		' "coverage":{"examined":["path"],"notExamined":["path: why"]}}',
 		'Use severity "blocker" only for what must change before this ships. An empty findings list means clean.',
 		...(later ? ['Give one verification for every finding id listed above. Do not report an open finding again as a new one.'] : [])
@@ -1012,6 +1130,15 @@ function asJson(value: unknown): string {
 	return '```json\n' + JSON.stringify(value, null, 1) + '\n```';
 }
 
+// The run's acceptance checklist with its ids, and what the phase does with it.
+function checklistBlock(run: WorkflowRun, task: string): string {
+	if (!run.acceptance?.length) return '';
+	return ['Acceptance checklist for this run:', ...run.acceptance.map((a) => `- ${a.id}: ${a.text}`), task].join('\n');
+}
+
+const WRITE_CHECKLIST =
+	'The issue has no acceptance list the workflow could read. Write one from the issue: each thing the change must do, one checkable item each. End your reply with a fenced ```json block: {"acceptance":[{"id":"A1","text":"..."}]}.';
+
 function implementPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): string[] {
 	const issue = issueBlock(ctx, run);
 	return [
@@ -1021,6 +1148,7 @@ function implementPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContex
 		issue
 			? 'Run the skill as far as writing tests and no further: implement what the issue above asks for and add tests.'
 			: 'Run the skill as far as writing tests and no further: read the issue, implement, and add tests.',
+		run.acceptance?.length ? checklistBlock(run, 'Meet every item; review checks each one by its id.') : WRITE_CHECKLIST,
 		IMPLEMENT_TEST_NOTE,
 		'You are already on the run\'s branch and worktree; do not create another. Do not commit, do not run the review loop, and do not open a PR.'
 	];
@@ -1093,7 +1221,7 @@ function reviewDiffBlock(run: WorkflowRun, ctx: PromptContext): string {
 // blocker has to clear.
 function priorFindingsBlock(run: WorkflowRun): string {
 	if (run.round === 0) return '';
-	const prior = openFindings(run).map(({ id, file, line, defect, fix }) => ({ id, file, line, defect, fix }));
+	const prior = openReviewFindings(run).map(({ id, file, line, defect, fix }) => ({ id, file, line, defect, fix }));
 	return [
 		...(prior.length
 			? ['The last round left these findings open. Check each one against the code now and report it under "verifications":', asJson(prior)]
@@ -1113,7 +1241,8 @@ function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext):
 		reviewScope(run, ctx),
 		reviewDiffBlock(run, ctx),
 		priorFindingsBlock(run),
-		findingsContract(run.round > 0)
+		checklistBlock(run, 'Report every item of this checklist under "acceptance" as met, unmet, or not_verifiable, with evidence. An unmet item is a blocker; do not repeat it as a finding.'),
+		findingsContract(run.round > 0, !!run.acceptance?.length)
 	];
 }
 
@@ -1198,6 +1327,23 @@ function closerPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 const ACCEPTANCE_NOTE =
 	'Before committing, check every requirement and acceptance item in the issue against the final diff. Put an "Acceptance" section in the PR body: one line per item, met or not met, with its evidence (file and line, command output, or the measured number). Include every number the issue asks to report, such as before and after timings or counts, measured on the final code. If any item is not met, do not commit and do not open the PR: list the unmet items and stop.';
 
+const PR_ACCEPTANCE_CONTRACT =
+	'Report every checklist item, met or not, so the workflow can check it: end your reply with a fenced ```json block: {"acceptance":[{"id":"A1","status":"met|unmet","evidence":"..."}]}. The PR step passes only when every item is met.';
+
+// The checklist the PR phase must account for, and what the owner already
+// accepted as unmet.
+function prChecklist(run: WorkflowRun): string[] {
+	if (!run.acceptance?.length) return [];
+	const accepted = run.acceptanceOverride?.ids ?? [];
+	return [
+		checklistBlock(run, 'The Acceptance section of the PR body lists these items by id.'),
+		accepted.length
+			? `The owner accepted ${accepted.join(', ')} as not met: open the PR anyway and mark them not met in its Acceptance section.`
+			: '',
+		PR_ACCEPTANCE_CONTRACT
+	];
+}
+
 function prPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): string[] {
 	const reviewer = run.reviewer ? ` reviewer=${run.reviewer}` : '';
 	return [
@@ -1205,6 +1351,7 @@ function prPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): str
 		PHASE_NOTE,
 		issueBlock(ctx, run),
 		ACCEPTANCE_NOTE,
+		...prChecklist(run),
 		'The work in this worktree is implemented, tested, and reviewed. Run the commit and PR step only: one commit, push, open the PR with the issue linked by a closing keyword, request the reviewers. Do not run any review loop.'
 	];
 }
@@ -1439,6 +1586,7 @@ export function runDigest(run: WorkflowRun, baseUrl: string): RunDigest {
 		blockers: blockerCount(run.findings),
 		findings: run.findings,
 		followUps: run.followUps ?? [],
+		acceptance: run.acceptance ?? [],
 		escalations: run.escalations,
 		humanTouched: run.humanTouched,
 		phases: run.steps.map((s) => phaseDigest(run, s)),

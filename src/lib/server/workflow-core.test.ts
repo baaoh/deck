@@ -19,6 +19,10 @@ import {
 	newRun,
 	normalizeRun,
 	openFindings,
+	acceptanceBlock,
+	acceptanceFromIssue,
+	acceptanceGaps,
+	acceptOverride,
 	parseStructured,
 	phasePrompt,
 	pickWorkflow,
@@ -642,6 +646,114 @@ describe('finding ids across rounds', () => {
 		const loaded = normalizeRun(JSON.parse(JSON.stringify(run)), NOW);
 		expect(loaded.findings.map((f) => f.id)).toEqual(['F5', 'F4']);
 		expect(loaded.findingSeq).toBe(5);
+	});
+});
+
+describe('the acceptance checklist', () => {
+	const body = ['## Context', '- not an ask', '## Acceptance criteria', '- [ ] exports CSV', '- [x] keeps the header', '1. reports the row count', '## Out of scope', '- PDF'].join('\n');
+
+	function withChecklist(): WorkflowRun {
+		const run = devRun();
+		run.acceptance = acceptanceFromIssue({ issueBody: body });
+		return run;
+	}
+
+	it('reads the acceptance items from the issue, numbered', () => {
+		expect(acceptanceFromIssue({ issueBody: body })).toEqual([
+			{ id: 'A1', text: 'exports CSV' },
+			{ id: 'A2', text: 'keeps the header' },
+			{ id: 'A3', text: 'reports the row count' }
+		]);
+		expect(acceptanceFromIssue({ issueBody: 'just prose' })).toEqual([]);
+		expect(acceptanceFromIssue(undefined)).toEqual([]);
+	});
+
+	it('shows implement the checklist, or asks it to write one and stores that', () => {
+		const run = withChecklist();
+		const prompt = phasePrompt(run, stepById(run, 'implement')!);
+		expect(prompt).toContain('- A1: exports CSV');
+		expect(prompt).not.toContain('Write one from the issue');
+
+		const bare = devRun();
+		expect(phasePrompt(bare, stepById(bare, 'implement')!)).toContain('{"acceptance":[{"id":"A1","text":"..."}]}');
+		const reply = parseStructured('```json\n{"acceptance":[{"id":"x","text":"exports CSV"},{"id":"y","text":" "},{"id":"z","text":"counts rows"}]}\n```')!;
+		step(bare, { pass: true, structured: reply });
+		expect(bare.acceptance).toEqual([
+			{ id: 'A1', text: 'exports CSV' },
+			{ id: 'A2', text: 'counts rows' }
+		]);
+	});
+
+	it('never replaces a checklist the issue gave', () => {
+		const run = withChecklist();
+		step(run, { pass: true, structured: { acceptance: [{ id: 'A1', text: 'something else' }] } });
+		expect(run.acceptance?.[0].text).toBe('exports CSV');
+	});
+
+	it('has review report each item, and makes an unmet one a blocker under its id', () => {
+		const run = withChecklist();
+		toReview(run);
+		const prompt = phasePrompt(run, stepById(run, 'review')!);
+		expect(prompt).toContain('- A2: keeps the header');
+		expect(prompt).toContain('"acceptance":[{"id":"A1","status":"met|unmet|not_verifiable"');
+		const reply = parseStructured('```json\n{"findings":[],"acceptance":[{"id":"a1","status":"met"},{"id":"A2","status":"not met","evidence":"header dropped"},{"id":"A3","status":"not_verifiable"}]}\n```')!;
+		step(run, { pass: false, structured: reply });
+		expect(run.phase).toBe('fix');
+		expect(run.findings).toEqual([
+			{ id: 'A2', file: 'acceptance', severity: 'blocker', defect: 'Acceptance item A2 is not met: keeps the header', fix: 'header dropped' }
+		]);
+		expect(run.acceptance?.map((a) => a.status)).toEqual(['met', 'unmet', 'not_verifiable']);
+		expect(phasePrompt(run, stepById(run, 'fix')!)).toContain('"id": "A2"');
+
+		// Round 2 does not ask to verify A2 by id: the checklist is reported again.
+		step(run, ok);
+		step(run, ok);
+		expect(phasePrompt(run, stepById(run, 'review')!)).not.toContain('The last round left these findings open');
+		step(run, { pass: false, structured: { findings: [], acceptance: [{ id: 'A2', status: 'unmet' }] } });
+		expect(run.openStreak).toEqual({ A2: 1 });
+		step(run, ok);
+		step(run, ok);
+		step(run, { pass: true, structured: { findings: [], acceptance: [{ id: 'A2', status: 'met' }] } });
+		expect(run.phase).toBe('pr');
+	});
+
+	it('has the PR phase report every item by id', () => {
+		const run = withChecklist();
+		const prompt = phasePrompt(run, stepById(run, 'pr')!);
+		expect(prompt).toContain('- A3: reports the row count');
+		expect(prompt).toContain('{"acceptance":[{"id":"A1","status":"met|unmet","evidence":"..."}]}');
+		expect(prompt).not.toContain('The owner accepted');
+		run.acceptanceOverride = { at: NOW, by: 'human', ids: ['A3'] };
+		expect(phasePrompt(run, stepById(run, 'pr')!)).toContain('The owner accepted A3 as not met');
+	});
+
+	it('gates the PR on every item reported met, unless the owner accepted the gaps', () => {
+		const run = withChecklist();
+		const met = (id: string) => ({ id, status: 'met' as const });
+		expect(acceptanceGaps(run, [met('A1'), met('A2'), met('A3')])).toEqual([]);
+		const gaps = acceptanceGaps(run, [met('A1'), { id: 'A2', status: 'unmet' }]);
+		expect(gaps.map((g) => [g.id, g.status])).toEqual([
+			['A2', 'unmet'],
+			['A3', undefined]
+		]);
+		const question = acceptanceBlock(gaps, 'https://github.com/acme/web/pull/9');
+		expect(question).toContain('- A2 (unmet): keeps the header');
+		expect(question).toContain('- A3 (no status reported)');
+		expect(question).toContain('A PR was opened anyway: https://github.com/acme/web/pull/9');
+		expect(acceptanceBlock(gaps, null)).toContain('No PR was opened.');
+		expect(acceptanceGaps(devRun(), [])).toEqual([]);
+		run.acceptanceOverride = { at: NOW, by: 'human', ids: ['A2', 'A3'] };
+		expect(acceptanceGaps(run, [])).toEqual([]);
+	});
+
+	it('records the override and goes on past the PR step', () => {
+		const run = withChecklist();
+		toReview(run);
+		step(run, review([]));
+		run.acceptanceOverride = { at: NOW, by: 'human', ids: ['A2'] };
+		expect(acceptOverride(run, NOW)).toEqual({ type: 'enter', step: 'feedback' });
+		expect(run.decisions.at(-1)).toMatchObject({ step: 'pr', action: 'accept-unmet', reason: expect.stringContaining('A2') });
+		expect(runDigest(run, 'http://x').acceptance).toHaveLength(3);
 	});
 });
 

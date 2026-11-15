@@ -235,10 +235,13 @@ async function startSkill(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisi
 	// text, so the session create hides the fetch's latency, and a control
 	// landing mid-spawn still sees the same ordering it always did.
 	const issue = issueContextFor(run, step);
-	if (step.role === 'implement' && !run.issueSizeOverride) {
-		const problem = core.issueSizeProblem((await issue.catch(() => ({}) as core.PromptContext)).issue);
+	if (step.role === 'implement') {
+		const text = (await issue.catch(() => ({}) as core.PromptContext)).issue;
 		if (stale(run, epoch)) return;
+		const problem = run.issueSizeOverride ? null : core.issueSizeProblem(text);
 		if (problem) return finish(run, epoch, { pass: false, block: { question: problem, kind: 'issue-size' } });
+		// Read once, before the first implement; one the issue lacked, implement writes.
+		if (!run.acceptance?.length) run.acceptance = core.acceptanceFromIssue(text);
 	}
 	// Created idle and sent its prompt here, after the stale check, rather than
 	// by the create pipeline: a pause or cancel landing mid-spawn then leaves an
@@ -281,12 +284,18 @@ function toRunPr(pr: NonNullable<Awaited<ReturnType<typeof wexec.prForBranch>>>)
 	return { repo: link?.repo ?? '', number: pr.number, url: pr.url, title: pr.title, baseRefName: pr.baseRefName };
 }
 
-// A PR is open for the branch and, for a GitHub issue, closes it. A missing
-// link is an error rather than a fail so the PR phase gets its retry.
-const prLinkedGate: Gate = async (run) => {
+// A PR is open for the branch and, for a GitHub issue, closes it, and the PR
+// phase reported every acceptance item met. A missing link is an error rather
+// than a fail so the PR phase gets its retry; an unmet item stops for the
+// owner, since running the phase again would not meet it.
+const prLinkedGate: Gate = async (run, text) => {
+	const reported = core.parseStructured(text)?.acceptance;
+	core.applyAcceptance(run, reported);
 	const pr = await wexec.prForBranch(run);
+	if (pr) run.pr = toRunPr(pr);
+	const gaps = core.acceptanceGaps(run, reported);
+	if (gaps.length) return { pass: false, block: { question: core.acceptanceBlock(gaps, pr?.url ?? null), kind: 'acceptance-unmet' } };
 	if (!pr) return { pass: false, error: 'no PR is open for the branch' };
-	run.pr = toRunPr(pr);
 	const n = core.githubIssueNumber(run.issue);
 	if (n !== null && !pr.closingIssuesReferences.some((r) => r.number === n)) {
 		return { pass: false, error: `${pr.url} does not close #${n}` };
@@ -748,12 +757,26 @@ const resume: Handler = async (run, body, actor) => {
 		run.epoch += 1;
 		return apply(run, core.acceptDismissal(run, Date.now()));
 	}
+	if (run.status === 'blocked' && run.block?.kind === 'acceptance-unmet' && phase === run.phase) return overrideAcceptance(run, phase, actor);
 	const paused = pausedEndFor(run, phase);
 	if (paused) return settlePausedEnd(run, paused);
 	closeOpen(run, 'resumed elsewhere');
 	freshStart(run, phase);
 	await enter(run, phase);
 };
+
+// The owner resumed past unmet acceptance items. With the PR already up and
+// linked the run goes on; otherwise the PR phase runs again, told to open it.
+async function overrideAcceptance(run: WorkflowRun, phase: string, actor: Actor): Promise<void> {
+	run.acceptanceOverride = { at: Date.now(), by: actor.by, ids: core.acceptanceGaps(run, run.acceptance).map((g) => g.id) };
+	freshStart(run, phase);
+	run.epoch += 1;
+	const epoch = run.epoch;
+	const linked = await prLinkedGate(run, null).catch(() => null);
+	if (stale(run, epoch)) return;
+	if (linked?.pass) return apply(run, core.acceptOverride(run, Date.now()));
+	await enter(run, phase);
+}
 
 // Run the current phase again from scratch, even if its turn already ended.
 const retry: Handler = async (run, _body, actor) => {

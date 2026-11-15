@@ -476,6 +476,66 @@ describe('finding ids across review rounds', () => {
 	});
 });
 
+describe('the acceptance checklist', () => {
+	const body = ['## Acceptance', '- exports CSV', '- counts rows'].join('\n');
+	const acceptance = (statuses: Record<string, string>) =>
+		'```json\n' + JSON.stringify({ acceptance: Object.entries(statuses).map(([id, status]) => ({ id, status, evidence: 'e' })) }) + '\n```';
+
+	async function toPr(): Promise<WorkflowRun> {
+		fake.issueContext = { issueTitle: 'Export', issueBody: body };
+		const run = await start();
+		expect(run.acceptance).toEqual([
+			{ id: 'A1', text: 'exports CSV' },
+			{ id: 'A2', text: 'counts rows' }
+		]);
+		expect(promptOf(0)).toContain('- A2: counts rows');
+		await finishTurn(run); // -> review
+		await finishTurn(run, findings(0)); // -> pr
+		expect(run.phase).toBe('pr');
+		expect(promptOf(-1)).toContain('- A1: exports CSV');
+		return run;
+	}
+
+	it('passes the PR step when every item is reported met', async () => {
+		const run = await toPr();
+		await finishTurn(run, acceptance({ A1: 'met', A2: 'met' }));
+		expect(run.status).toBe('done');
+	});
+
+	it('blocks for the owner on an unmet item, saying a PR went up anyway, and goes on once overridden', async () => {
+		const run = await toPr();
+		await finishTurn(run, acceptance({ A1: 'met', A2: 'unmet' }));
+		expect(run.status).toBe('blocked');
+		expect(run.block).toMatchObject({ step: 'pr', kind: 'acceptance-unmet' });
+		expect(run.block?.question).toContain('- A2 (unmet): counts rows');
+		expect(run.block?.question).toContain('A PR was opened anyway: https://github.com/acme/web/pull/9');
+		const before = fake.created.length;
+		await runner.runAction(run.id, 'resume', { reason: 'counting comes in a later issue' });
+		await settle();
+		expect(run.acceptanceOverride).toMatchObject({ by: 'human', ids: ['A2'] });
+		expect(run.status).toBe('done');
+		expect(fake.created).toHaveLength(before);
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'accept-unmet' });
+	});
+
+	it('with no PR opened, runs the PR step again once overridden, told to open it', async () => {
+		const run = await toPr();
+		const pr = fake.pr;
+		fake.pr = null;
+		await finishTurn(run, acceptance({ A1: 'met' }));
+		expect(run.block?.question).toContain('- A2 (no status reported)');
+		expect(run.block?.question).toContain('No PR was opened.');
+		await runner.runAction(run.id, 'resume', {});
+		await settle();
+		expect(run.phase).toBe('pr');
+		expect(run.status).toBe('running');
+		expect(promptOf(-1)).toContain('The owner accepted A2 as not met');
+		fake.pr = pr;
+		await finishTurn(run, 'opened it');
+		expect(run.status).toBe('done');
+	});
+});
+
 describe('a closer dismissal', () => {
 	async function toCloser(): Promise<WorkflowRun> {
 		const run = await start();
