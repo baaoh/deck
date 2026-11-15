@@ -177,6 +177,7 @@ async function reviewContext(run: WorkflowRun, visit: PhaseVisit): Promise<core.
 	if (unchanged) return { unchanged };
 	const later = run.reviewTree && run.round > 0 ? run.reviewTree : undefined;
 	const delta = later ? await wexec.deltaBetween(run.cwd, later, tree) : undefined;
+	visit.delta = delta;
 	const from = later ?? base;
 	// Best effort: without it the reviewer reads the diff itself, as before.
 	const diff = from ? await wexec.diffText(run.cwd, from, tree).catch(() => '') : '';

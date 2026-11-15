@@ -17,6 +17,7 @@ import {
 	type Coverage,
 	type Finding,
 	type FixReport,
+	type Verification,
 	type PhaseStatus,
 	type PhaseVisit,
 	type RunBlockKind,
@@ -366,15 +367,30 @@ export function beginVisit(run: WorkflowRun, stepId: string, now: number): Phase
 
 // ---- Structured output ----
 
+const optionalText = z.string().optional().catch(undefined);
+
 const findingSchema = z.object({
+	// Read but never trusted: the engine gives every finding its own id.
+	id: optionalText,
 	file: z.string(),
 	line: z.number().int().optional().catch(undefined),
 	// Normalised once here, so the gate, the digest, and the prompts all compare
 	// the same `blocker`.
 	severity: z.string().transform((s) => s.toLowerCase()),
 	defect: z.string(),
-	fix: z.string().optional().catch(undefined),
-	keep: z.string().optional().catch(undefined)
+	scenario: optionalText,
+	via: optionalText,
+	fix: optionalText,
+	keep: optionalText
+});
+
+// `not fixed`, `Not-Fixed` and `not_fixed` all read the same.
+const status = z.string().transform((s) => s.trim().toLowerCase().replace(/[\s-]+/g, '_'));
+
+const verificationSchema = z.object({
+	id: z.string(),
+	status: status.pipe(z.enum(['fixed', 'not_fixed', 'regressed'])),
+	evidence: z.string().catch('')
 });
 
 const fixReportSchema = z.object({
@@ -392,6 +408,7 @@ const coverageSchema = z.object({
 // role decides which ones it needs.
 export interface Structured {
 	findings?: Finding[];
+	verifications?: Verification[];
 	coverage?: Coverage;
 	disagreements?: string[];
 	fixes?: FixReport[];
@@ -404,6 +421,15 @@ export interface Structured {
 const structuredSchema = z
 	.object({
 		findings: z.array(findingSchema).optional(),
+		// One malformed entry drops only itself, never the findings beside it.
+		verifications: z
+			.array(z.unknown())
+			.transform((list) => list.flatMap((v) => {
+				const parsed = verificationSchema.safeParse(v);
+				return parsed.success ? [parsed.data] : [];
+			}))
+			.optional()
+			.catch(undefined),
 		coverage: coverageSchema.optional(),
 		disagreements: z.array(z.string()).optional(),
 		// Never fails the block: a malformed report must not lose the disagreements beside it.
@@ -536,15 +562,118 @@ function onReviewCap(run: WorkflowRun, step: WorkflowStep, blockers: number, now
 	return blockRun(run, step.id, `${blockers} blockers still standing after ${run.round} review rounds.`, now);
 }
 
-// Keep this round's findings and move the last round's blockers into history.
-function recordRound(run: WorkflowRun, structured: Structured | undefined): number {
+// ---- Findings across rounds ----
+
+function idNumber(id: string | undefined): number {
+	return /^F(\d+)$/.exec(id ?? '')?.[1] ? Number(id!.slice(1)) : 0;
+}
+
+// The next run-scoped finding id. A run stored before `findingSeq` existed
+// starts after the highest id it already holds.
+function nextFindingId(run: WorkflowRun): string {
+	const held = [...run.findings, ...(run.pastFindings ?? []), ...(run.followUps ?? [])];
+	const seq = run.findingSeq ?? Math.max(0, ...held.map((f) => idNumber(f.id)));
+	run.findingSeq = seq + 1;
+	return `F${run.findingSeq}`;
+}
+
+// Give every finding of the run an id, in place.
+function ensureFindingIds(run: WorkflowRun): void {
+	for (const f of run.findings) if (!f.id) f.id = nextFindingId(run);
+}
+
+// The blockers a round left open, which the next round checks by id.
+export function openFindings(run: WorkflowRun): Finding[] {
+	ensureFindingIds(run);
+	return run.findings.filter((f) => f.severity === 'blocker');
+}
+
+// A delta entry (`src/a.ts:L4-6,L9`) as its file and line ranges.
+function parseDelta(entry: string): { file: string; ranges: [number, number][] } {
+	const at = entry.lastIndexOf(':');
+	const ranges = entry
+		.slice(at + 1)
+		.split(',')
+		.map((r) => r.replace(/^L/, '').split('-').map(Number))
+		.filter((r) => r.every(Number.isFinite))
+		.map(([a, b]) => [a, b ?? a] as [number, number]);
+	return { file: entry.slice(0, at), ranges };
+}
+
+function inRanges(delta: string[], file: string, line: number | undefined): boolean {
+	return delta.some((entry) => {
+		const d = parseDelta(entry);
+		return d.file === file && (line === undefined || d.ranges.some(([a, b]) => line >= a && line <= b));
+	});
+}
+
+// `src/a.ts:12` (or `src/a.ts:L12`) as a file and line.
+function location(ref: string): { file: string; line?: number } {
+	const m = /^(.*):L?(\d+)$/.exec(ref.trim());
+	return m ? { file: m[1], line: Number(m[2]) } : { file: ref.trim() };
+}
+
+// Why a new blocker in round 2+ does not count, or null when it does: it must
+// give a failing scenario and sit in what this round was asked to read (the
+// changed ranges, a direct caller of them named by `via`, or a file an earlier
+// round skipped). Without a delta to compare against, scope is not judged.
+function newBlockerProblem(f: Finding, delta: string[] | undefined, skipped: string[]): string | null {
+	if (!f.scenario?.trim()) return 'no failing scenario';
+	if (!delta?.length) return null;
+	if (inRanges(delta, f.file, f.line) || skipped.includes(f.file)) return null;
+	const via = f.via ? location(f.via) : null;
+	if (via && inRanges(delta, via.file, via.line)) return null;
+	return 'outside the changed ranges and their direct callers';
+}
+
+// The last round's open findings as this round judged them: the ones still
+// open (no verdict counts as not fixed, so a blocker is never dropped by
+// omission) and the ones fixed.
+function checkPrior(prior: Finding[], verifications: Verification[]): { open: Finding[]; fixed: Finding[] } {
+	const byId = new Map(verifications.map((v) => [v.id, v]));
+	const open: Finding[] = [];
+	const fixed: Finding[] = [];
+	for (const f of prior) {
+		const v = byId.get(f.id!);
+		if (v?.status === 'fixed') fixed.push(f);
+		else open.push({ ...f, verification: { status: v?.status ?? 'not_fixed', evidence: v?.evidence ?? 'not checked by the review' } });
+	}
+	return { open, fixed };
+}
+
+// This round's new findings, each with its own id. From round 2 on, a blocker
+// that fails newBlockerProblem becomes a nit and is kept for a follow-up issue.
+function judgeNew(run: WorkflowRun, stepId: string, raw: Finding[], delta: string[] | undefined, now: number): Finding[] {
+	const skipped = (run.coverage?.notExamined ?? []).map((s) => s.split(':')[0].trim());
+	const downgraded: string[] = [];
+	const out = raw.map((f) => {
+		const finding = { ...f, id: nextFindingId(run) };
+		if (run.round < 2 || finding.severity !== 'blocker') return finding;
+		const problem = newBlockerProblem(finding, delta, skipped);
+		if (!problem) return finding;
+		const nit = { ...finding, severity: 'nit' };
+		run.followUps = [...(run.followUps ?? []), nit];
+		downgraded.push(`${finding.id} (${problem})`);
+		return nit;
+	});
+	if (downgraded.length) decide(run, stepId, 'downgrade', `New blockers kept for a follow-up issue as nits: ${downgraded.join(', ')}.`, now);
+	return out;
+}
+
+// Record a review round: the last round's open findings are checked by id
+// (fixed ones go into history), new ones get ids, and the round's blockers are
+// the ones still open plus the new blockers that count.
+function recordRound(run: WorkflowRun, step: WorkflowStep, structured: Structured | undefined, now: number): { blockers: number; stillOpen: string[] } {
+	const prior = run.round > 0 ? openFindings(run) : [];
 	run.round += 1;
 	run.verifyOutput = undefined;
-	run.reviewTree = lastVisit(run)?.tree ?? run.reviewTree;
-	run.pastFindings = [...(run.pastFindings ?? []), ...run.findings.filter((f) => f.severity === 'blocker')].slice(-50);
-	run.findings = structured?.findings ?? [];
+	const visit = lastVisit(run);
+	run.reviewTree = visit?.tree ?? run.reviewTree;
+	const { open, fixed } = checkPrior(prior, structured?.verifications ?? []);
+	run.pastFindings = [...(run.pastFindings ?? []), ...fixed].slice(-50);
+	run.findings = [...open, ...judgeNew(run, step.id, structured?.findings ?? [], visit?.delta, now)];
 	run.coverage = structured?.coverage;
-	return blockerCount(run.findings);
+	return { blockers: blockerCount(run.findings), stillOpen: open.map((f) => f.id!) };
 }
 
 // Two or more blockers in round 1 prove the task needed the stronger implementer.
@@ -554,9 +683,40 @@ function maybeEscalateImplementer(run: WorkflowRun, step: WorkflowStep, blockers
 	decide(run, step.id, 'escalate', `Round 1 found ${blockers} blockers; fixes move to the stronger implementer.`, now);
 }
 
+function describeFinding(f: Finding): string {
+	return `${f.id} (${f.file}${f.line ? `:${f.line}` : ''}): ${f.defect}`;
+}
+
+// A finding reported still open in two rounds running moves the next fix to
+// the step's escalateAgent; still open after that fix, the run stops for the
+// owner. Only consecutive rounds count: a finding fixed once starts over.
+function trackStuck(run: WorkflowRun, step: WorkflowStep, stillOpen: string[], now: number): Effect | null {
+	const streak: Record<string, number> = {};
+	for (const id of stillOpen) streak[id] = (run.openStreak?.[id] ?? 0) + 1;
+	run.openStreak = streak;
+	const named = (ids: string[]) => run.findings.filter((f) => ids.includes(f.id!));
+	const stuck = named(stillOpen.filter((id) => streak[id] >= 3));
+	if (stuck.length) {
+		const list = stuck.map(describeFinding).join('\n');
+		return blockRun(run, step.id, `Still not fixed after an escalated fix:\n${list}\nFix it by hand or answer how, then resume.`, now);
+	}
+	const due = named(stillOpen.filter((id) => streak[id] === 2));
+	if (!due.length) return null;
+	const already = run.escalations.implementer;
+	run.escalations.implementer = true;
+	const ids = due.map((f) => f.id).join(', ');
+	decide(run, step.id, 'escalate', `${ids} not fixed in two rounds running; ${already ? 'the next fix is already at' : 'the next fix moves to'} the stronger implementer.`, now);
+	return null;
+}
+
 function onReview(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
-	const blockers = recordRound(run, result.structured);
+	const { blockers, stillOpen } = recordRound(run, step, result.structured, now);
+	// The gate counted the raw block; the round's real count is the engine's.
+	const visit = lastVisit(run);
+	if (visit) Object.assign(visit, { result: blockers ? 'fail' : 'pass', detail: `${blockers} blockers, ${run.findings.length} findings` });
 	maybeEscalateImplementer(run, step, blockers, now);
+	const stuck = trackStuck(run, step, stillOpen, now);
+	if (stuck) return stuck;
 	if (blockers === 0) return goTo(run, step.next, now);
 	if (run.round >= (step.cap ?? REVIEW_ROUND_CAP)) return onReviewCap(run, step, blockers, now);
 	return failTo(run, step, `${blockers} blockers.`, now);
@@ -815,12 +975,18 @@ function issueBlock(ctx: PromptContext, run: WorkflowRun): string {
 		.join('\n\n');
 }
 
-const FINDINGS_CONTRACT = [
-	'End your reply with one fenced ```json block, exactly this shape, so the workflow can read the verdict:',
-	'{"findings":[{"file":"path","line":1,"severity":"blocker|nit","defect":"...","fix":"...","keep":"..."}],',
-	' "coverage":{"examined":["path"],"notExamined":["path: why"]}}',
-	'Use severity "blocker" only for what must change before this ships. An empty findings list means clean.'
-].join('\n');
+// What a review round returns. From round 2 on it also checks each finding the
+// last round left open, by id.
+function findingsContract(later: boolean): string {
+	const verifications = '"verifications":[{"id":"F1","status":"fixed|not_fixed|regressed","evidence":"what in the code shows it"}],\n ';
+	return [
+		'End your reply with one fenced ```json block, exactly this shape, so the workflow can read the verdict:',
+		`{${later ? verifications : ''}"findings":[{"file":"path","line":1,"severity":"blocker|nit","defect":"...","scenario":"input or steps, and the wrong result","fix":"...","keep":"..."}],`,
+		' "coverage":{"examined":["path"],"notExamined":["path: why"]}}',
+		'Use severity "blocker" only for what must change before this ships. An empty findings list means clean.',
+		...(later ? ['Give one verification for every finding id listed above. Do not report an open finding again as a new one.'] : [])
+	].join('\n');
+}
 
 const PHASE_NOTE = 'This session is one phase of a deck workflow run. Another phase does the next step; stop when yours is done.';
 // Tests run once per round, in the verify step, so the shared test machine
@@ -923,6 +1089,19 @@ function reviewDiffBlock(run: WorkflowRun, ctx: PromptContext): string {
 		.join('\n');
 }
 
+// Round 2+: what the last round left open, to check by id, and the bar a new
+// blocker has to clear.
+function priorFindingsBlock(run: WorkflowRun): string {
+	if (run.round === 0) return '';
+	const prior = openFindings(run).map(({ id, file, line, defect, fix }) => ({ id, file, line, defect, fix }));
+	return [
+		...(prior.length
+			? ['The last round left these findings open. Check each one against the code now and report it under "verifications":', asJson(prior)]
+			: []),
+		'A new blocker counts only if it gives a concrete failing "scenario" (the input or steps, and the wrong result) and sits in the scope above: the changed ranges, a direct caller of them (name the changed file:line it calls in "via"), or a file listed as not examined. Anything else is a nit, kept for a follow-up issue.'
+	].join('\n');
+}
+
 function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): string[] {
 	return [
 		skillLine(step, ''),
@@ -933,7 +1112,8 @@ function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext):
 		issueBlock(ctx, run),
 		reviewScope(run, ctx),
 		reviewDiffBlock(run, ctx),
-		FINDINGS_CONTRACT
+		priorFindingsBlock(run),
+		findingsContract(run.round > 0)
 	];
 }
 
@@ -956,13 +1136,13 @@ function followUpPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 const FIX_CONTRACT = [
 	'For each finding (or each test failure), re-derive it from the code before changing anything. Prefer adding a test that fails before your change and passes after it.',
 	'End your reply with one fenced ```json block, exactly this shape:',
-	'{"fixes":[{"finding":"file:line of the finding","change":"file:line you changed","evidence":"test name or command and its result"}]}'
+	'{"fixes":[{"finding":"the finding\'s id (F1), or file:line of a test failure","change":"file:line you changed","evidence":"test name or command and its result"}]}'
 ].join('\n');
 
 // The red output, and the blockers still open from the last review so a test fix
 // does not quietly undo them.
 function redTestsTask(run: WorkflowRun): string[] {
-	const open = run.findings.filter((f) => f.severity === 'blocker');
+	const open = openFindings(run);
 	return [
 		'The tests or typecheck failed. Fix the cause. Output tail:',
 		'```',
@@ -977,7 +1157,7 @@ function fixPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 	// verifyOutput is set only while verify is red, and cleared when it passes.
 	const task = run.verifyOutput
 		? redTestsTask(run)
-		: ['Address these review findings in the working tree:', asJson(run.findings.filter((f) => f.severity === 'blocker'))];
+		: ['Address these review findings in the working tree. Each has an id; name it in your fixes report:', asJson(openFindings(run))];
 	const earlier = run.pastFindings?.length ? ['Earlier review rounds asked for these, and they were applied:', asJson(run.pastFindings)] : [];
 	return [
 		skillLine(step, issueRef(run)),
@@ -1006,7 +1186,7 @@ function closerPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 		skillLine(step, issueRef(run)),
 		PHASE_NOTE,
 		`These blockers are still standing after ${run.round} review rounds:`,
-		asJson(run.findings.filter((f) => f.severity === 'blocker')),
+		asJson(openFindings(run)),
 		'Either produce the correct fix in the working tree (no commit), or rule them invalid.',
 		EDIT_TEST_NOTE,
 		'End with a fenced ```json block: {"dismissed": true or false, "reason": "why"}.'
@@ -1258,6 +1438,7 @@ export function runDigest(run: WorkflowRun, baseUrl: string): RunDigest {
 		loop: run.loop,
 		blockers: blockerCount(run.findings),
 		findings: run.findings,
+		followUps: run.followUps ?? [],
 		escalations: run.escalations,
 		humanTouched: run.humanTouched,
 		phases: run.steps.map((s) => phaseDigest(run, s)),
@@ -1289,6 +1470,7 @@ export function normalizeRun(raw: WorkflowRun, now: number): WorkflowRun {
 		epoch: raw.epoch ?? 0,
 		round: raw.round ?? 0
 	};
+	ensureFindingIds(run);
 	if (!isFinished(run) && !currentStep(run)) blockRun(run, run.phase, `The workflow has no step "${run.phase}" any more.`, now);
 	return run;
 }

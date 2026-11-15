@@ -18,6 +18,7 @@ import {
 	matchProfile,
 	newRun,
 	normalizeRun,
+	openFindings,
 	parseStructured,
 	phasePrompt,
 	pickWorkflow,
@@ -63,7 +64,12 @@ function step(run: WorkflowRun, result: GateResult) {
 	return effect;
 }
 
-const blocker = (file = 'src/a.ts'): Finding => ({ file, line: 1, severity: 'blocker', defect: 'broken' });
+const blocker = (file = 'src/a.ts'): Finding => ({ file, line: 1, severity: 'blocker', defect: 'broken', scenario: 'null input returns 500' });
+// A later round: every finding the last round left open checked as fixed, plus new ones.
+const fixedThen = (run: WorkflowRun, findings: Finding[]): GateResult => ({
+	pass: blockerCount(findings) === 0,
+	structured: { findings, verifications: openFindings(run).map((f) => ({ id: f.id!, status: 'fixed' as const, evidence: 'a.test.ts' })) }
+});
 const review = (findings: Finding[]): GateResult => ({ pass: blockerCount(findings) === 0, structured: { findings } });
 const ok: GateResult = { pass: true };
 const red: GateResult = { pass: false, output: 'FAIL src/a.test.ts' };
@@ -233,12 +239,15 @@ describe('advance: the dev loop', () => {
 	it('gives standing blockers one top-tier closer at the cap, then blocks', () => {
 		const run = devRun();
 		toReview(run);
-		for (let i = 0; i < 4; i++) {
-			step(run, review([blocker()]));
+		step(run, review([blocker()]));
+		step(run, ok);
+		step(run, ok);
+		for (let i = 0; i < 3; i++) {
+			step(run, fixedThen(run, [blocker()]));
 			step(run, ok);
 			step(run, ok);
 		}
-		step(run, review([blocker()]));
+		step(run, fixedThen(run, [blocker()]));
 		expect(run.round).toBe(5);
 		expect(run.phase).toBe('closer');
 		expect(run.escalations.cap).toBe(true);
@@ -246,7 +255,7 @@ describe('advance: the dev loop', () => {
 		step(run, ok); // closer fixed it -> verify
 		step(run, ok); // -> final review round
 		expect(run.phase).toBe('review');
-		expect(step(run, review([blocker()]))).toEqual({ type: 'block' });
+		expect(step(run, fixedThen(run, [blocker()]))).toEqual({ type: 'block' });
 		expect(run.block?.question).toContain('6 review rounds');
 	});
 
@@ -357,7 +366,7 @@ describe('phase prompts', () => {
 		step(run, review([blocker('src/first.ts')]));
 		step(run, ok);
 		step(run, ok);
-		step(run, review([blocker('src/second.ts')]));
+		step(run, fixedThen(run, [blocker('src/second.ts')]));
 		const prompt = phasePrompt(run, stepById(run, 'fix')!);
 		expect(prompt).toContain('src/second.ts');
 		expect(prompt).toContain('Earlier review rounds asked for these');
@@ -512,8 +521,132 @@ describe('advance: a block result', () => {
 	});
 });
 
+describe('finding ids across rounds', () => {
+	const verdict = (id: string, status: 'fixed' | 'not_fixed' | 'regressed') => ({ id, status, evidence: 'see a.test.ts' });
+	const later = (findings: Finding[], verifications: ReturnType<typeof verdict>[]): GateResult => ({ pass: false, structured: { findings, verifications } });
+
+	// Round 1 with the given blockers, then fix and verify back to review.
+	function round1(run: WorkflowRun, findings: Finding[]): void {
+		toReview(run);
+		step(run, review(findings));
+		step(run, ok);
+		step(run, ok);
+	}
+
+	it('gives each finding a run-scoped id and hands round 2 the open ones to verify', () => {
+		const run = devRun();
+		round1(run, [blocker('src/a.ts'), { file: 'src/b.ts', severity: 'nit', defect: 'naming' }]);
+		expect(run.findings.map((f) => f.id)).toEqual(['F1', 'F2']);
+		const prompt = phasePrompt(run, stepById(run, 'review')!);
+		expect(prompt).toContain('The last round left these findings open');
+		expect(prompt).toContain('"id": "F1"');
+		expect(prompt).not.toContain('"id": "F2"');
+		expect(prompt).toContain('"verifications":[{"id":"F1","status":"fixed|not_fixed|regressed"');
+		expect(prompt).toContain('concrete failing "scenario"');
+		expect(phasePrompt(devRun(), stepById(run, 'review')!)).not.toContain('"verifications"');
+	});
+
+	it('counts the open findings still not fixed plus the new blockers that count', () => {
+		const run = devRun();
+		round1(run, [blocker('src/a.ts'), blocker('src/b.ts'), blocker('src/c.ts')]);
+		step(run, later([blocker('src/d.ts')], [verdict('F1', 'fixed'), verdict('F2', 'regressed')]));
+		expect(run.findings.map((f) => [f.id, f.severity])).toEqual([
+			['F2', 'blocker'],
+			['F3', 'blocker'],
+			['F4', 'blocker']
+		]);
+		// F3 had no verdict: still open, never dropped by omission.
+		expect(run.findings[1].verification).toEqual({ status: 'not_fixed', evidence: 'not checked by the review' });
+		expect(run.findings[0].verification?.status).toBe('regressed');
+		expect(run.pastFindings?.map((f) => f.id)).toEqual(['F1']);
+		expect(run.visits.filter((v) => v.step === 'review').at(-1)).toMatchObject({ result: 'fail', detail: '3 blockers, 3 findings' });
+		const fix = phasePrompt(run, stepById(run, 'fix')!);
+		expect(fix).toContain('"id": "F2"');
+		expect(fix).toContain('name it in your fixes report');
+	});
+
+	it('passes once every open finding is verified fixed', () => {
+		const run = devRun();
+		round1(run, [blocker()]);
+		step(run, later([], [verdict('F1', 'fixed')]));
+		expect(run.phase).toBe('pr');
+	});
+
+	it('turns a later-round blocker without a scenario, or outside the delta, into a follow-up nit', () => {
+		const run = devRun();
+		round1(run, [blocker()]);
+		run.visits.at(-1)!.delta = ['src/a.ts:L10-20'];
+		run.coverage = { examined: [], notExamined: ['src/skipped.ts: too long'] };
+		const noScenario = { ...blocker('src/a.ts'), line: 12, scenario: undefined };
+		const outside = { ...blocker('src/far.ts'), line: 3 };
+		const inRange = { ...blocker('src/a.ts'), line: 15 };
+		const caller = { ...blocker('src/caller.ts'), line: 40, via: 'src/a.ts:11' };
+		const skipped = { ...blocker('src/skipped.ts'), line: 99 };
+		step(run, later([noScenario, outside, inRange, caller, skipped], [verdict('F1', 'fixed')]));
+		expect(run.findings.map((f) => [f.id, f.severity])).toEqual([
+			['F2', 'nit'],
+			['F3', 'nit'],
+			['F4', 'blocker'],
+			['F5', 'blocker'],
+			['F6', 'blocker']
+		]);
+		expect(run.followUps?.map((f) => f.id)).toEqual(['F2', 'F3']);
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'downgrade', reason: expect.stringContaining('F2 (no failing scenario), F3 (outside the changed ranges') });
+		expect(runDigest(run, 'http://x').followUps.map((f) => f.id)).toEqual(['F2', 'F3']);
+	});
+
+	it('never downgrades a round-1 blocker', () => {
+		const run = devRun();
+		toReview(run);
+		step(run, review([{ ...blocker(), scenario: undefined }]));
+		expect(run.findings[0].severity).toBe('blocker');
+		expect(run.followUps).toBeUndefined();
+	});
+
+	it('escalates the fix after two rounds not fixed, and blocks naming the finding after the escalated fix', () => {
+		const run = devRun();
+		round1(run, [blocker()]);
+		expect(run.escalations.implementer).toBe(false);
+		step(run, later([], [verdict('F1', 'not_fixed')]));
+		expect(run.escalations.implementer).toBe(false);
+		step(run, ok);
+		step(run, ok);
+		step(run, later([], [verdict('F1', 'not_fixed')]));
+		expect(run.escalations.implementer).toBe(true);
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'escalate', reason: expect.stringContaining('F1 not fixed in two rounds running') });
+		expect(run.phase).toBe('fix');
+		expect(run.visits.at(-1)?.agent).toEqual(stepById(run, 'fix')!.escalateAgent);
+		step(run, ok);
+		step(run, ok);
+		expect(step(run, later([], [verdict('F1', 'not_fixed')]))).toEqual({ type: 'block' });
+		expect(run.block?.question).toContain('F1 (src/a.ts:1): broken');
+	});
+
+	it('starts the count over once a finding is fixed', () => {
+		const run = devRun();
+		round1(run, [blocker('src/a.ts'), blocker('src/b.ts')]);
+		run.escalations.implementer = false;
+		step(run, later([], [verdict('F1', 'not_fixed'), verdict('F2', 'fixed')]));
+		expect(run.openStreak).toEqual({ F1: 1 });
+	});
+
+	it('reads verification statuses loosely and drops a malformed one alone', () => {
+		const parsed = parseStructured('```json\n{"findings":[],"verifications":[{"id":"F1","status":"Not fixed","evidence":"x"},{"id":"F2","status":"maybe"},{"status":"fixed"}]}\n```');
+		expect(parsed?.verifications).toEqual([{ id: 'F1', status: 'not_fixed', evidence: 'x' }]);
+		expect(parsed?.findings).toEqual([]);
+	});
+
+	it('gives the findings of a run stored before ids their ids on load', () => {
+		const run = devRun();
+		run.findings = [blocker('src/a.ts'), { ...blocker('src/b.ts'), id: 'F4' }];
+		const loaded = normalizeRun(JSON.parse(JSON.stringify(run)), NOW);
+		expect(loaded.findings.map((f) => f.id)).toEqual(['F5', 'F4']);
+		expect(loaded.findingSeq).toBe(5);
+	});
+});
+
 describe('the fix contract', () => {
-	const contract = '{"fixes":[{"finding":"file:line of the finding","change":"file:line you changed","evidence":"test name or command and its result"}]}';
+	const contract = '{"fixes":[{"finding":"the finding\'s id (F1), or file:line of a test failure","change":"file:line you changed","evidence":"test name or command and its result"}]}';
 
 	it('ends every fix prompt with the fixes block, for findings and for red tests', () => {
 		const run = devRun();

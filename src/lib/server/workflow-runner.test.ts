@@ -193,7 +193,8 @@ const findings = (n: number) =>
 			file: `src/${i}.ts`,
 			line: 1,
 			severity: 'blocker',
-			defect: 'd'
+			defect: 'd',
+			scenario: 'an empty list throws'
 		}))
 	}) +
 	'\n```';
@@ -452,6 +453,26 @@ describe('the review gets its diff inline', () => {
 		expect(fake.diffs).toEqual([]);
 		expect(promptOf(1)).toContain('Scope: the whole branch diff');
 		expect(promptOf(1)).not.toContain('diff --git');
+	});
+});
+
+describe('finding ids across review rounds', () => {
+	it('checks round 1\'s findings by id and keeps an out-of-scope new blocker for a follow-up', async () => {
+		const run = await start();
+		await finishTurn(run); // -> review round 1
+		await finishTurn(run, findings(1)); // F1 -> fix
+		fake.trees.push('t1');
+		await finishTurn(run); // -> review round 2, scoped to src/hand.ts:L1-3
+		expect(run.visits.at(-1)?.delta).toEqual(['src/hand.ts:L1-3']);
+		expect(promptOf(-1)).toContain('"id": "F1"');
+		const round2 = {
+			verifications: [{ id: 'F1', status: 'fixed', evidence: 'src/0.test.ts passes' }],
+			findings: [{ file: 'src/0.ts', line: 1, severity: 'blocker', defect: 'd2', scenario: 'an empty list throws' }]
+		};
+		await finishTurn(run, '```json\n' + JSON.stringify(round2) + '\n```');
+		expect(run.phase).toBe('pr');
+		expect(run.followUps).toMatchObject([{ id: 'F2', severity: 'nit', defect: 'd2' }]);
+		expect(run.pastFindings?.map((f) => f.id)).toEqual(['F1']);
 	});
 });
 

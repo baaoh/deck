@@ -100,12 +100,31 @@ export const FINISHED_RUN: readonly RunStatus[] = ['done', 'cancelled'];
 
 // One review finding as dev-review emits it in its structured block.
 export interface Finding {
+	// Given by the engine, stable across rounds (F1, F2, ...), so a later round
+	// can say which earlier finding it checked. Runs stored before ids get them
+	// on load.
+	id?: string;
 	file: string;
 	line?: number;
 	severity: string;
 	defect: string;
+	// A round 2+ blocker's failing case: the input or steps and the wrong result.
+	scenario?: string;
+	// A finding outside the changed ranges: the changed file:line it directly calls.
+	via?: string;
 	fix?: string;
 	keep?: string;
+	// The last round's word on a finding carried over as still open.
+	verification?: { status: VerificationStatus; evidence: string };
+}
+
+export type VerificationStatus = 'fixed' | 'not_fixed' | 'regressed';
+
+// A later review round's check of one finding the round before left open.
+export interface Verification {
+	id: string;
+	status: VerificationStatus;
+	evidence: string;
 }
 
 // One entry of a fix phase's report: the finding, where the change went, and
@@ -137,6 +156,9 @@ export interface PhaseVisit {
 	detail?: string;
 	// A person drove this phase's session during a take-over.
 	humanTouched?: boolean;
+	// Review rounds 2+: the ranges that changed since the last round, which bound
+	// where a new blocker may be raised.
+	delta?: string[];
 	// Review visits: the working-tree snapshot the reviewer was shown. It becomes
 	// the run's `reviewTree` only once the round completes, so a round cut short
 	// by a restart doesn't move the next round's baseline.
@@ -218,6 +240,13 @@ export interface WorkflowRun {
 	// Blockers earlier rounds raised (and the fix phases applied), so a fixer can
 	// tell when a new finding asks to undo one.
 	pastFindings?: Finding[];
+	// The last finding id handed out (F<n>).
+	findingSeq?: number;
+	// Consecutive rounds each finding id has been reported still open.
+	openStreak?: Record<string, number>;
+	// Findings a later round raised that the engine turned into nits (no failing
+	// scenario, or outside what changed), kept for a follow-up issue.
+	followUps?: Finding[];
 	coverage?: Coverage;
 	// The working-tree snapshot the last review saw, so the next round's delta is
 	// computed from the tree (hand edits included), not from the last commit.
@@ -310,6 +339,7 @@ export interface RunDigest {
 	loop: boolean;
 	blockers: number;
 	findings: Finding[];
+	followUps: Finding[];
 	escalations: WorkflowRun['escalations'];
 	humanTouched: boolean;
 	phases: RunPhaseDigest[];
