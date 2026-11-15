@@ -151,7 +151,7 @@ export function runVerify(
 	command: string,
 	signal?: AbortSignal,
 	timeoutMs = VERIFY_TIMEOUT_MS
-): Promise<{ code: number; output: string }> {
+): Promise<{ code: number; output: string; timedOut: boolean }> {
 	const waitFile = path.join(os.tmpdir(), `deck-verify-wait-${process.pid}-${crypto.randomUUID()}`);
 	const env = { ...process.env, CI: '1', DECK_VERIFY_WAIT_FILE: waitFile };
 	const child = spawn('sh', ['-c', command], { cwd: confined(cwd), env, detached: true });
@@ -160,22 +160,28 @@ export function runVerify(
 	child.stdout.on('data', collect);
 	child.stderr.on('data', collect);
 	const stop = () => killGroup(child.pid);
+	let timedOut = false;
 	let ran = 0;
 	let last = Date.now();
 	const clock = setInterval(() => {
 		const now = Date.now();
 		if (!fs.existsSync(waitFile)) ran += now - last;
 		last = now;
-		if (ran >= timeoutMs) stop();
+		if (ran >= timeoutMs && !timedOut) {
+			timedOut = true;
+			stop();
+		}
 	}, Math.min(VERIFY_TICK_MS, timeoutMs / 4));
 	signal?.addEventListener('abort', stop, { once: true });
 	return new Promise((resolve) => {
 		child.on('error', (e) => collect(Buffer.from(e.message)));
-		child.on('close', (code) => {
+		child.on('close', (code, sig) => {
 			clearInterval(clock);
 			fs.rmSync(waitFile, { force: true });
 			signal?.removeEventListener('abort', stop);
-			resolve({ code: code ?? 1, output: output || 'command failed' });
+			// Killed by a signal (the OOM killer's SIGKILL): report it the way a shell would, 128 + signal.
+			const signum = sig ? os.constants.signals[sig] : undefined;
+			resolve({ code: code ?? (signum ? 128 + signum : 1), output: output || 'command failed', timedOut });
 		});
 	});
 }

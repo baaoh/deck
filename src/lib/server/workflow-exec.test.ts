@@ -115,7 +115,7 @@ describe('syncPullWorktree', () => {
 
 describe('runVerify', () => {
 	it('returns the exit code and the output tail', async () => {
-		expect(await runVerify(repo, 'echo ok')).toEqual({ code: 0, output: 'ok\n' });
+		expect(await runVerify(repo, 'echo ok')).toEqual({ code: 0, output: 'ok\n', timedOut: false });
 		expect((await runVerify(repo, 'echo bad >&2; exit 3')).code).toBe(3);
 	});
 
@@ -126,19 +126,20 @@ describe('runVerify', () => {
 		for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
 		const pid = Number(fs.readFileSync(pidFile, 'utf8'));
 		controller.abort();
-		expect((await running).code).not.toBe(0);
+		expect(await running).toMatchObject({ code: 143, timedOut: false });
 		await new Promise((r) => setTimeout(r, 50));
 		expect(() => process.kill(pid, 0)).toThrow();
 	});
 	it('stops the command once its running time passes the timeout', async () => {
 		const result = await runVerify(repo, 'sleep 30', undefined, 200);
 		expect(result.code).not.toBe(0);
+		expect(result.timedOut).toBe(true);
 	});
 
 	it('pauses the timeout while the command says it is waiting in a queue', async () => {
 		// Waits 600 ms behind the wait file, then runs for 100 ms: only the 100 ms count.
 		const queued = 'touch "$DECK_VERIFY_WAIT_FILE"; sleep 0.6; rm "$DECK_VERIFY_WAIT_FILE"; sleep 0.1; echo done';
-		expect(await runVerify(repo, queued, undefined, 400)).toEqual({ code: 0, output: 'done\n' });
+		expect(await runVerify(repo, queued, undefined, 400)).toEqual({ code: 0, output: 'done\n', timedOut: false });
 	});
 });
 

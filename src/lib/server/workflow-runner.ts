@@ -141,12 +141,23 @@ async function startVerify(run: WorkflowRun, step: WorkflowStep, visit: PhaseVis
 	if (!command) return finish(run, epoch, { pass: true, skipped: true, detail: 'no test command found' });
 	visit.detail = command;
 	commit(run);
-	const { code, output } = await trackedVerify(run, command);
-	await finish(run, epoch, { pass: code === 0, detail: `${command} exited ${code}`, output });
+	// An infrastructure failure (a kill, out of memory, a timeout) says nothing
+	// about the code: run the same tree again rather than starting a fix, and
+	// leave the red count alone.
+	for (let attempt = 0; ; attempt++) {
+		const { code, output, timedOut } = await trackedVerify(run, command);
+		if (stale(run, epoch)) return;
+		const infra = core.verifyInfraFailure(code, output, timedOut);
+		const detail = `${command} exited ${code}`;
+		if (!infra) return finish(run, epoch, { pass: code === 0, detail, output });
+		if (attempt >= core.VERIFY_INFRA_RETRIES) return finish(run, epoch, { pass: false, detail, output, block: { question: core.verifyInfraBlock(infra) } });
+		run.decisions.push({ at: Date.now(), by: 'engine', step: step.id, action: 'retry', reason: `${detail}: ${infra}; running the tests again.` });
+		commit(run);
+	}
 }
 
 // Run the verify command where a cancel, block, or resume can stop it.
-async function trackedVerify(run: WorkflowRun, command: string): Promise<{ code: number; output: string }> {
+async function trackedVerify(run: WorkflowRun, command: string): Promise<{ code: number; output: string; timedOut?: boolean }> {
 	const controller = new AbortController();
 	verifying.set(run.id, controller);
 	return wexec.runVerify(run.cwd, command, controller.signal).finally(() => {

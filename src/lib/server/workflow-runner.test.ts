@@ -20,6 +20,9 @@ const fake = vi.hoisted(() => ({
 	baseTree: 'tbase' as string | null,
 	deltas: [] as [string, string][],
 	verifyCode: 0,
+	// Results for the next verify runs, before falling back to verifyCode.
+	verifyResults: [] as { code: number; output: string; timedOut?: boolean }[],
+	verifyRuns: 0,
 	// Whether fetchPullRef freshly fetched pr/<n>, and the PR checkouts the runner refreshed.
 	prRefCreated: true,
 	synced: [] as [string, number][],
@@ -116,10 +119,11 @@ vi.mock('./workflow-exec', () => ({
 	syncPullWorktree: async (cwd: string, n: number) => void fake.synced.push([cwd, n]),
 	toplevel: async (dir: string) => (dir.startsWith('/p/acme/') ? '/p/acme' : dir),
 	verifyCommand: () => 'pnpm test',
-	runVerify: async () => ({
-		code: fake.verifyCode,
-		output: fake.verifyCode ? 'FAIL' : 'ok'
-	}),
+	runVerify: async () => {
+		fake.verifyRuns += 1;
+		const next = fake.verifyResults.shift();
+		return next ?? { code: fake.verifyCode, output: fake.verifyCode ? 'FAIL' : 'ok' };
+	},
 	prForBranch: async () => fake.pr,
 	prReviewView: async () => {
 		if (fake.viewGate) await fake.viewGate;
@@ -226,6 +230,8 @@ beforeEach(() => {
 	fake.baseTree = 'tbase';
 	fake.deltas = [];
 	fake.verifyCode = 0;
+	fake.verifyResults = [];
+	fake.verifyRuns = 0;
 	fake.prRefCreated = true;
 	fake.synced = [];
 	fake.spawnGate = null;
@@ -352,6 +358,36 @@ describe('a usage limit', () => {
 		await settle();
 		expect(run.status).toBe('running');
 		expect(fake.created).toHaveLength(2);
+	});
+});
+
+describe('infrastructure test failures', () => {
+	it('runs the tests again without a fix session, then carries on when they pass', async () => {
+		fake.verifyResults = [{ code: 137, output: 'Killed' }];
+		const run = await start();
+		await finishTurn(run); // implement -> verify killed, rerun green -> review
+		expect(fake.verifyRuns).toBe(2);
+		expect(run.phase).toBe('review');
+		expect(run.failures['verify#red'] ?? 0).toBe(0);
+		expect(fake.created.map((b) => b.title)).not.toContain('#7 · Fix');
+	});
+
+	it('blocks after two reruns that still fail for the same reason', async () => {
+		fake.verifyResults = [0, 1, 2].map(() => ({ code: 1, output: 'FATAL ERROR: Reached heap limit - JavaScript heap out of memory' }));
+		const run = await start();
+		await finishTurn(run);
+		expect(fake.verifyRuns).toBe(3);
+		expect(run.status).toBe('blocked');
+		expect(run.block?.question).toBe('tests keep failing for infrastructure reasons: out of memory');
+		expect(fake.created).toHaveLength(1);
+	});
+
+	it('sends a real failure to the fix phase as before', async () => {
+		fake.verifyResults = [{ code: 1, output: 'FAIL src/a.test.ts' }];
+		const run = await start();
+		await finishTurn(run);
+		expect(fake.verifyRuns).toBe(1);
+		expect(run.phase).toBe('fix');
 	});
 });
 

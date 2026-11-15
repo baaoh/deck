@@ -648,6 +648,24 @@ export function usageLimitHit(errors: string): boolean {
 	return USAGE_LIMIT.test(errors);
 }
 
+export const VERIFY_INFRA_RETRIES = 2;
+
+// Why a red verify run says nothing about the code, or null for a real failure:
+// the run was killed or ran out of memory, or it timed out (deck's own verify
+// timeout, or test-slot's exit 124). Rerun those; don't send them to a fix.
+export function verifyInfraFailure(code: number, output: string, timedOut = false): string | null {
+	if (code === 0) return null;
+	if (timedOut) return 'the verify command timed out';
+	if (code === 124) return 'the test slot timed out (exit 124)';
+	if (/JavaScript heap out of memory|\bENOMEM\b/.test(output)) return 'out of memory';
+	if (code === 137 || /(^|\s)Killed(\s|$)/.test(output)) return `killed (exit ${code})`;
+	return null;
+}
+
+export function verifyInfraBlock(reason: string): string {
+	return `tests keep failing for infrastructure reasons: ${reason}`;
+}
+
 // ---- Before a review round ----
 
 // The visit before the current one, skipping verify, came from the fix step.

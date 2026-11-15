@@ -24,6 +24,7 @@ import {
 	runDigest,
 	unchangedReviewReason,
 	usageLimitHit,
+	verifyInfraFailure,
 	stepById,
 	type GateResult,
 	type PrReviewView
@@ -371,6 +372,23 @@ describe('usageLimitHit', () => {
 		expect(usageLimitHit('')).toBe(false);
 		expect(usageLimitHit('codex turn failed: sandbox denied')).toBe(false);
 		expect(usageLimitHit('API Error: 500 overloaded')).toBe(false);
+	});
+});
+
+describe('verifyInfraFailure', () => {
+	it('names kills, memory, and timeouts', () => {
+		expect(verifyInfraFailure(137, 'whatever')).toBe('killed (exit 137)');
+		expect(verifyInfraFailure(1, 'sh: line 1:  4242 Killed   node test.js')).toBe('killed (exit 1)');
+		expect(verifyInfraFailure(134, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory')).toBe('out of memory');
+		expect(verifyInfraFailure(1, 'Error: spawn ENOMEM')).toBe('out of memory');
+		expect(verifyInfraFailure(124, '')).toBe('the test slot timed out (exit 124)');
+		expect(verifyInfraFailure(143, 'partial output', true)).toBe('the verify command timed out');
+	});
+
+	it('leaves real failures and passes alone', () => {
+		expect(verifyInfraFailure(0, 'Killed')).toBeNull();
+		expect(verifyInfraFailure(1, 'FAIL src/a.test.ts > kills the worker')).toBeNull();
+		expect(verifyInfraFailure(2, 'error TS2322: Type is not assignable')).toBeNull();
 	});
 });
 
