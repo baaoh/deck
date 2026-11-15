@@ -19,6 +19,7 @@ const fake = vi.hoisted(() => ({
 	// The base branch's tree at the fork point; null when it can't be read.
 	baseTree: 'tbase' as string | null,
 	deltas: [] as [string, string][],
+	diffs: [] as [string, string][],
 	verifyCode: 0,
 	// Results for the next verify runs, before falling back to verifyCode.
 	verifyResults: [] as { code: number; output: string; timedOut?: boolean }[],
@@ -109,6 +110,10 @@ vi.mock('./confine', () => ({
 vi.mock('./workflow-exec', () => ({
 	snapshotTree: async () => fake.trees.at(-1),
 	baseTree: async () => fake.baseTree,
+	diffText: async (_cwd: string, from: string, to: string) => {
+		fake.diffs.push([from, to]);
+		return `diff --git a/src/${to}.ts b/src/${to}.ts\n+changed\n`;
+	},
 	deltaBetween: async (_cwd: string, from: string, to: string) => {
 		fake.deltas.push([from, to]);
 		return [`src/hand.ts:L1-3`];
@@ -229,6 +234,7 @@ beforeEach(() => {
 	fake.trees = ['t0'];
 	fake.baseTree = 'tbase';
 	fake.deltas = [];
+	fake.diffs = [];
 	fake.verifyCode = 0;
 	fake.verifyResults = [];
 	fake.verifyRuns = 0;
@@ -421,6 +427,31 @@ describe('an oversized issue', () => {
 		const run = await start();
 		expect(run.status).toBe('running');
 		expect(fake.created).toHaveLength(1);
+	});
+});
+
+describe('the review gets its diff inline', () => {
+	it('hands round 1 the branch diff and later rounds only what changed since', async () => {
+		const run = await start();
+		await finishTurn(run); // -> review round 1 at t0
+		expect(fake.diffs).toEqual([['tbase', 't0']]);
+		expect(promptOf(1)).toContain('The branch diff against the base branch, uncommitted changes included');
+		expect(promptOf(1)).toContain('diff --git a/src/t0.ts b/src/t0.ts');
+		await finishTurn(run, findings(1)); // -> fix
+		fake.trees.push('t1');
+		await finishTurn(run); // -> review round 2 at t1
+		expect(fake.diffs.at(-1)).toEqual(['t0', 't1']);
+		expect(promptOf(-1)).toContain('What changed since the last review round');
+		expect(promptOf(-1)).toContain('diff --git a/src/t1.ts b/src/t1.ts');
+	});
+
+	it('reviews without the diff when the base cannot be read', async () => {
+		fake.baseTree = null;
+		const run = await start();
+		await finishTurn(run);
+		expect(fake.diffs).toEqual([]);
+		expect(promptOf(1)).toContain('Scope: the whole branch diff');
+		expect(promptOf(1)).not.toContain('diff --git');
 	});
 });
 

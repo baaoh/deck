@@ -168,12 +168,19 @@ async function trackedVerify(run: WorkflowRun, command: string): Promise<{ code:
 // A review round's scope: everything the tree changed since the last round saw
 // it, hand edits included, from two snapshots rather than the last commit.
 // `unchanged` says why there is nothing to review, so no session is started.
+// The diff itself goes in the prompt too: the whole branch in round 1, only
+// what changed since the last round after that.
 async function reviewContext(run: WorkflowRun, visit: PhaseVisit): Promise<core.PromptContext & { unchanged?: string }> {
 	const tree = (visit.tree = await wexec.snapshotTree(run.cwd));
-	const unchanged = core.unchangedReviewReason(run, tree, await wexec.baseTree(run.cwd, run.base));
+	const base = await wexec.baseTree(run.cwd, run.base);
+	const unchanged = core.unchangedReviewReason(run, tree, base);
 	if (unchanged) return { unchanged };
-	const delta = run.reviewTree && run.round > 0 ? await wexec.deltaBetween(run.cwd, run.reviewTree, tree) : undefined;
-	return { delta };
+	const later = run.reviewTree && run.round > 0 ? run.reviewTree : undefined;
+	const delta = later ? await wexec.deltaBetween(run.cwd, later, tree) : undefined;
+	const from = later ?? base;
+	// Best effort: without it the reviewer reads the diff itself, as before.
+	const diff = from ? await wexec.diffText(run.cwd, from, tree).catch(() => '') : '';
+	return { delta, diff: diff ? core.capDiff(diff) : undefined };
 }
 
 function phaseTitle(run: WorkflowRun, step: WorkflowStep, visit: PhaseVisit): string {

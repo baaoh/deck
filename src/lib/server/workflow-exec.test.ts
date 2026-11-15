@@ -12,7 +12,7 @@ vi.mock('./confine', () => ({
 	confineRelative: (root: string, rel: string) => path.join(root, rel)
 }));
 
-const { baseTree, deltaBetween, pushState, runVerify, snapshotTree, syncPullWorktree, toplevel } = await import('./workflow-exec');
+const { baseTree, deltaBetween, diffText, pushState, runVerify, snapshotTree, syncPullWorktree, toplevel } = await import('./workflow-exec');
 
 const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-exec-'));
 const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' }).trim();
@@ -65,7 +65,10 @@ describe('baseTree', () => {
 			expect(await baseTree(dir, 'main')).toBe(forkTree);
 			expect(await snapshotTree(dir)).toBe(forkTree);
 			fs.writeFileSync(path.join(dir, 'a.ts'), 'two\n');
-			expect(await snapshotTree(dir)).not.toBe(forkTree);
+			const changed = await snapshotTree(dir);
+			expect(changed).not.toBe(forkTree);
+			expect(await diffText(dir, forkTree, changed)).toContain('-one\n+two');
+			await expect(diffText(dir, '--output=/tmp/x', changed)).rejects.toThrow('invalid diff range');
 			expect(await baseTree(dir, 'nope')).toBeNull();
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });

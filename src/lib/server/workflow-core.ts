@@ -745,6 +745,8 @@ export function issueSizeProblem(issue: IssueText | undefined): string | null {
 export interface PromptContext {
 	// Round 2+ review scope as file ranges.
 	delta?: string[];
+	// The diff a review round examines, already capped (see capDiff).
+	diff?: CappedDiff;
 	// The issue's own text, fetched once when the phase starts (see
 	// server/issues/prompt.ts). Handed to the phase so it reads the issue from
 	// the prompt rather than spending a tool call and its tokens fetching what
@@ -847,6 +849,57 @@ function reviewScope(run: WorkflowRun, ctx: PromptContext): string {
 	].join('\n');
 }
 
+export const REVIEW_DIFF_CAP = 60_000;
+
+export interface CappedDiff {
+	text: string;
+	// Files whose diff did not fit, by name.
+	omitted: string[];
+	truncated: boolean;
+}
+
+function diffFile(section: string): string {
+	const header = section.split('\n', 1)[0];
+	return /^diff --git a\/.* b\/(.*)$/.exec(header)?.[1] ?? header.replace(/^diff --git /, '');
+}
+
+// A diff cut to about `cap` characters at file boundaries. Files that don't fit
+// are listed by name; a first file too big on its own is cut mid-way.
+export function capDiff(diff: string, cap = REVIEW_DIFF_CAP): CappedDiff {
+	const sections = diff.split(/^(?=diff --git )/m).filter(Boolean);
+	let text = '';
+	let i = 0;
+	for (; i < sections.length && text.length + sections[i].length <= cap; i++) text += sections[i];
+	if (i === sections.length) return { text, omitted: [], truncated: false };
+	if (!text) text = sections[i++].slice(0, cap);
+	return { text, omitted: sections.slice(i).map(diffFile), truncated: true };
+}
+
+// A fence longer than any backtick run inside the diff, so a markdown file in
+// it can't close the block early.
+function fenceFor(text: string): string {
+	const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
+	return '`'.repeat(Math.max(3, longest + 1));
+}
+
+function reviewDiffBlock(run: WorkflowRun, ctx: PromptContext): string {
+	const diff = ctx.diff;
+	if (!diff?.text.trim()) return '';
+	const what = run.round === 0 || !ctx.delta?.length
+		? `The branch diff against ${run.base ?? 'the base branch'}, uncommitted changes included`
+		: 'What changed since the last review round';
+	const fence = fenceFor(diff.text);
+	const cut = diff.truncated
+		? [
+				`The diff above is cut at about ${REVIEW_DIFF_CAP.toLocaleString('en-US')} characters.${diff.omitted.length ? ' These files changed too and are not shown; read their diffs yourself:' : ''}`,
+				...diff.omitted.map((f) => `- ${f}`)
+			].join('\n')
+		: '';
+	return [`${what}, so you do not need to run git diff for it:`, `${fence}diff\n${diff.text.replace(/\n$/, '')}\n${fence}`, cut]
+		.filter(Boolean)
+		.join('\n');
+}
+
 function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext): string[] {
 	return [
 		skillLine(step, ''),
@@ -856,6 +909,7 @@ function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext):
 		`The change is for ${issueRef(run)}; judge it against that issue's acceptance criteria.`,
 		issueBlock(ctx, run),
 		reviewScope(run, ctx),
+		reviewDiffBlock(run, ctx),
 		FINDINGS_CONTRACT
 	];
 }

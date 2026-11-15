@@ -61,6 +61,12 @@ export async function baseTree(cwd: string, base: string | undefined): Promise<s
 	return null;
 }
 
+// The full diff between two trees or commits, as the review prompt shows it.
+export async function diffText(cwd: string, from: string, to: string): Promise<string> {
+	if (!isFlagSafe(from) || !isFlagSafe(to)) throw new Error('invalid diff range');
+	return git(cwd, ['diff', '--no-color', '--no-ext-diff', from, to]);
+}
+
 // The ranges that changed between two snapshots.
 export async function deltaBetween(cwd: string, from: string, to: string): Promise<string[]> {
 	return deltaRanges(await git(cwd, ['diff', '-U0', from, to]));

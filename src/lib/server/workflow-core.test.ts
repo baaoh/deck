@@ -5,6 +5,7 @@ import {
 	agentFor,
 	beginVisit,
 	blockerCount,
+	capDiff,
 	deltaRanges,
 	detectVerifyCommand,
 	feedbackDue,
@@ -419,6 +420,47 @@ describe('issue size', () => {
 	it('never stops a run without issue text', () => {
 		expect(issueSizeProblem(undefined)).toBeNull();
 		expect(issueSizeProblem({ warnings: ['gh failed'] })).toBeNull();
+	});
+});
+
+describe('capDiff', () => {
+	const file = (name: string, size: number) => `diff --git a/${name} b/${name}\n${'+'.repeat(size)}\n`;
+
+	it('keeps a diff under the cap whole', () => {
+		const diff = file('a.ts', 10) + file('b.ts', 10);
+		expect(capDiff(diff, 1000)).toEqual({ text: diff, omitted: [], truncated: false });
+	});
+
+	it('cuts at a file boundary and lists the files left out by name', () => {
+		const diff = file('a.ts', 40) + file('b.ts', 40) + file('c.ts', 5);
+		const out = capDiff(diff, 100);
+		expect(out.text).toBe(file('a.ts', 40));
+		expect(out.omitted).toEqual(['b.ts', 'c.ts']);
+		expect(out.truncated).toBe(true);
+	});
+
+	it('cuts a first file that is too big on its own', () => {
+		const out = capDiff(file('big.ts', 500) + file('b.ts', 5), 100);
+		expect(out.text).toHaveLength(100);
+		expect(out.omitted).toEqual(['b.ts']);
+		expect(out.truncated).toBe(true);
+	});
+
+	it('says so in the review prompt when the diff was cut', () => {
+		const run = devRun();
+		toReview(run);
+		const prompt = phasePrompt(run, stepById(run, 'review')!, { diff: capDiff(file('a.ts', 40) + file('b.ts', 40), 100) });
+		expect(prompt).toContain('```diff\ndiff --git a/a.ts b/a.ts');
+		expect(prompt).toContain('cut at about 60,000 characters');
+		expect(prompt).toContain('- b.ts');
+		expect(prompt).toContain('Scope: the whole branch diff against main');
+	});
+
+	it('fences a diff that holds backticks with a longer fence', () => {
+		const run = devRun();
+		toReview(run);
+		const prompt = phasePrompt(run, stepById(run, 'review')!, { diff: capDiff('diff --git a/x.md b/x.md\n+```js\n') });
+		expect(prompt).toContain('````diff\n');
 	});
 });
 
