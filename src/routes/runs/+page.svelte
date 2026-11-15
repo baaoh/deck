@@ -343,7 +343,7 @@
 								<span class="w-8 text-right text-xs opacity-50">{relativeTime(run.updatedAt)}</span>
 							</div>
 							<div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs opacity-60">
-								<span class="truncate">{run.workflow.name}</span>
+								<span class="truncate">{run.workflow.name}{run.workflow.variantOf ? ` (variant of ${run.workflow.variantOf})` : ''}</span>
 								<span aria-hidden="true">·</span>
 								<span class="truncate">{basename(run.projectPath)}</span>
 								<span aria-hidden="true">·</span>

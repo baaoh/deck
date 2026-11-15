@@ -127,7 +127,8 @@ const defSchema = z.object({
 	name: z.string().min(1),
 	category: z.enum(WORKFLOW_CATEGORIES),
 	default: z.boolean().optional(),
-	steps: z.array(stepSchema).min(1)
+	variants: z.array(z.string().min(1)).min(1).optional(),
+	steps: z.array(stepSchema).default([])
 });
 
 // The first transition that points nowhere, or null when every `next` and
@@ -176,6 +177,7 @@ function roleProblem(def: WorkflowDef): string | null {
 
 // A shape problem the schema can't see.
 function stepProblem(def: WorkflowDef): string | null {
+	if (!def.steps.length && !def.variants) return 'needs at least one step, or variants';
 	const dangling = danglingTransition(def);
 	return idProblem(def) ?? roleProblem(def) ?? (dangling && `step transition points nowhere: ${dangling}`);
 }
@@ -201,14 +203,51 @@ export function resolveWorkflows(raw: unknown): { workflows: WorkflowDef[]; prob
 	const list = Array.isArray((raw as { workflows?: unknown })?.workflows)
 		? ((raw as { workflows: unknown[] }).workflows)
 		: [];
-	const byId = new Map(BUILTIN_WORKFLOWS.map((w) => [w.id, w]));
+	const builtins = new Map(BUILTIN_WORKFLOWS.map((w) => [w.id, w]));
+	const byId = new Map(builtins);
 	const problems: string[] = [];
 	for (const item of list) {
 		const { def, problem } = parseDef(item);
 		if (def) byId.set(def.id, def);
 		else problems.push(problem!);
 	}
+	// Variants are checked once every definition is in, since one may name a
+	// workflow listed after it. A bad wrapper is dropped (a built-in it replaced
+	// comes back); its variants stay.
+	for (const def of [...byId.values()]) {
+		const problem = variantProblem(def, byId);
+		if (!problem) continue;
+		problems.push(`${def.id}: ${problem}`);
+		if (builtins.has(def.id)) byId.set(def.id, builtins.get(def.id)!);
+		else byId.delete(def.id);
+	}
 	return { workflows: withOneDefault([...byId.values()]), problems };
+}
+
+// Why a workflow's variants can't run, or null: each must be another known
+// workflow of the same category with steps of its own and no variants.
+function variantProblem(def: WorkflowDef, byId: Map<string, WorkflowDef>): string | null {
+	for (const id of def.variants ?? []) {
+		const v = byId.get(id);
+		if (!v) return `variant "${id}" is not a known workflow`;
+		if (v.variants) return `variant "${id}" has variants of its own`;
+		if (v.category !== def.category) return `variant "${id}" is a ${v.category} workflow, not ${def.category}`;
+	}
+	return null;
+}
+
+// The workflow a run on `def` actually runs: `def` itself, or one of its
+// variants picked uniformly with `random` (in [0, 1)), naming `def` as what it
+// is a variant of.
+export function resolveVariant(
+	defs: WorkflowDef[],
+	def: WorkflowDef,
+	random: () => number = Math.random
+): { def: WorkflowDef; variantOf?: string } {
+	if (!def.variants?.length) return { def };
+	const id = def.variants[Math.min(def.variants.length - 1, Math.floor(random() * def.variants.length))];
+	const picked = defs.find((d) => d.id === id);
+	return picked ? { def: picked, variantOf: def.id } : { def };
 }
 
 // Exactly one default per category: the last one marked wins, so a user
@@ -283,6 +322,8 @@ export interface NewRunInput {
 	issue?: SessionIssue;
 	pr?: RunPr;
 	profile: ResolvedProfile;
+	// The workflow that picked `def` as its variant.
+	variantOf?: string;
 	now: number;
 }
 
@@ -292,6 +333,7 @@ export function newRun(input: NewRunInput): WorkflowRun {
 		id: input.id,
 		workflowId: def.id,
 		workflowName: def.name,
+		...(input.variantOf ? { variantOf: input.variantOf } : {}),
 		category: def.category,
 		steps: def.steps,
 		projectPath: input.projectPath,
@@ -1570,7 +1612,7 @@ export function runDigest(run: WorkflowRun, baseUrl: string): RunDigest {
 	return {
 		id: run.id,
 		url: `${baseUrl}/runs/${run.id}`,
-		workflow: { id: run.workflowId, name: run.workflowName, category: run.category },
+		workflow: { id: run.workflowId, name: run.workflowName, category: run.category, ...(run.variantOf ? { variantOf: run.variantOf } : {}) },
 		title: run.title,
 		projectPath: run.projectPath,
 		cwd: run.cwd,

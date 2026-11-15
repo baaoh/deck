@@ -27,6 +27,7 @@ import {
 	phasePrompt,
 	pickWorkflow,
 	resolveWorkflows,
+	resolveVariant,
 	reviewedAtHead,
 	runDigest,
 	unchangedReviewReason,
@@ -136,6 +137,52 @@ describe('workflow definitions', () => {
 	it('picks by id when one is named', () => {
 		expect(pickWorkflow(BUILTIN_WORKFLOWS, { id: 'review' })?.category).toBe('review');
 		expect(pickWorkflow(BUILTIN_WORKFLOWS, { id: 'gone' })).toBeUndefined();
+	});
+});
+
+describe('workflow variants', () => {
+	const dev = BUILTIN_WORKFLOWS.find((w) => w.id === 'dev')!;
+	const a = { ...dev, id: 'dev-a', name: 'Dev A', default: false };
+	const b = { ...dev, id: 'dev-b', name: 'Dev B', default: false };
+	const ab = { id: 'ab', name: 'A/B', category: 'dev', default: true, variants: ['dev-a', 'dev-b'] };
+
+	it('accepts a wrapper with no steps of its own, naming workflows listed after it', () => {
+		const { workflows, problems } = resolveWorkflows({ workflows: [ab, a, b] });
+		expect(problems).toEqual([]);
+		expect(pickWorkflow(workflows, { category: 'dev' })?.id).toBe('ab');
+	});
+
+	it('reports unknown, nested, or cross-category variants and drops the wrapper', () => {
+		const nested = { ...ab, id: 'outer', default: false, variants: ['ab'] };
+		const unknown = { ...ab, id: 'lost', default: false, variants: ['nope'] };
+		const review = { ...ab, id: 'mixed', default: false, variants: ['review'] };
+		const empty = { id: 'bare', name: 'Bare', category: 'dev' };
+		const { workflows, problems } = resolveWorkflows({ workflows: [a, b, ab, nested, unknown, review, empty] });
+		expect(problems).toEqual([
+			'bare: needs at least one step, or variants',
+			'outer: variant "ab" has variants of its own',
+			'lost: variant "nope" is not a known workflow',
+			'mixed: variant "review" is a review workflow, not dev'
+		]);
+		expect(workflows.map((w) => w.id)).not.toContain('outer');
+		expect(workflows.map((w) => w.id)).toContain('ab');
+	});
+
+	it('brings a built-in back when a bad wrapper replaced it', () => {
+		const { workflows } = resolveWorkflows({ workflows: [{ ...ab, id: 'dev', variants: ['nope'] }] });
+		expect(workflows.find((w) => w.id === 'dev')?.steps.length).toBeGreaterThan(0);
+	});
+
+	it('picks a variant uniformly with the given randomness, and records the wrapper', () => {
+		const { workflows } = resolveWorkflows({ workflows: [a, b, ab] });
+		const wrapper = workflows.find((w) => w.id === 'ab')!;
+		expect(resolveVariant(workflows, wrapper, () => 0).def.id).toBe('dev-a');
+		expect(resolveVariant(workflows, wrapper, () => 0.5).def.id).toBe('dev-b');
+		expect(resolveVariant(workflows, wrapper, () => 0.999)).toMatchObject({ def: { id: 'dev-b' }, variantOf: 'ab' });
+		expect(resolveVariant(workflows, workflows.find((w) => w.id === 'dev-a')!)).toEqual({ def: expect.objectContaining({ id: 'dev-a' }) });
+		const picked = resolveVariant(workflows, wrapper, () => 0);
+		const run = newRun({ id: 'r', def: picked.def, variantOf: picked.variantOf, projectPath: '/p', cwd: '/p', branch: 'b', title: 't', profile: { loop: false }, now: NOW });
+		expect(runDigest(run, 'http://x').workflow).toEqual({ id: 'dev-a', name: 'Dev A', category: 'dev', variantOf: 'ab' });
 	});
 });
 

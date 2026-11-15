@@ -616,17 +616,19 @@ function assertFits(def: WorkflowDef, req: StartRunRequest): void {
 
 function resolveStart(req: StartRunRequest) {
 	const category = req.category ?? (req.pr ? 'review' : 'dev');
-	const def = core.pickWorkflow(store.loadWorkflows().workflows, { id: req.workflow, category });
-	if (!def) error(400, req.workflow ? `no workflow "${req.workflow}"` : 'no default workflow for that category');
+	const { workflows } = store.loadWorkflows();
+	const asked = core.pickWorkflow(workflows, { id: req.workflow, category });
+	if (!asked) error(400, req.workflow ? `no workflow "${req.workflow}"` : 'no default workflow for that category');
+	const { def, variantOf } = core.resolveVariant(workflows, asked);
 	assertFits(def, req);
 	const real = resolveWithinProjects(req.cwd);
 	const projectPath = real === null ? null : projectForPath(real);
 	if (real === null || projectPath === null) error(403, 'cwd must be within the registered project set');
-	return { def, real, project: listProjects().find((p) => p.path === projectPath)! };
+	return { def, variantOf, real, project: listProjects().find((p) => p.path === projectPath)! };
 }
 
 export async function startRun(req: StartRunRequest): Promise<WorkflowRun> {
-	const { def, real, project } = resolveStart(req);
+	const { def, variantOf, real, project } = resolveStart(req);
 	const origin = await originRepo(project.path).catch(() => null);
 	const mismatch = core.repoMismatch(origin, req.pr);
 	if (mismatch) error(400, mismatch);
@@ -645,6 +647,7 @@ export async function startRun(req: StartRunRequest): Promise<WorkflowRun> {
 		issue: req.issue,
 		pr: req.pr,
 		profile,
+		variantOf,
 		now: Date.now()
 	});
 	store.saveRun(run);

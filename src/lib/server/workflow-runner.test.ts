@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeckSession, Project } from '$lib/types';
 import type { WorkflowRun } from '$lib/workflows';
+import { BUILTIN_WORKFLOWS } from './workflow-core';
 
 // The runner is orchestration: sessions spawn per phase, completions arrive as
 // feed events, and pause / take-over / resume / restart must not race them. Drive
@@ -42,7 +43,9 @@ const fake = vi.hoisted(() => ({
 	spawnGate: null as Promise<void> | null,
 	viewGate: null as Promise<void> | null,
 	// What the faked issue fetch hands the implement phase.
-	issueContext: {} as Record<string, unknown>
+	issueContext: {} as Record<string, unknown>,
+	// The user's workflows.json.
+	workflows: {} as unknown
 }));
 
 vi.mock('./agent-feed', async () => {
@@ -145,7 +148,7 @@ vi.mock('./workflow-store', async () => {
 			if (!fake.runs.includes(run)) fake.runs.push(run);
 		},
 		removeRuns: (ids: string[]) => void (fake.runs = fake.runs.filter((r) => !ids.includes(r.id))),
-		loadWorkflows: () => resolveWorkflows({}),
+		loadWorkflows: () => resolveWorkflows(fake.workflows),
 		loadProfiles: () => ({
 			acme: {
 				githubOwners: ['acme'],
@@ -254,6 +257,7 @@ beforeEach(() => {
 		closingIssuesReferences: [{ number: 7 }]
 	};
 	fake.runs = [];
+	fake.workflows = {};
 });
 
 describe('a dev run end to end', () => {
@@ -533,6 +537,24 @@ describe('the acceptance checklist', () => {
 		fake.pr = pr;
 		await finishTurn(run, 'opened it');
 		expect(run.status).toBe('done');
+	});
+});
+
+describe('workflow variants', () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	it('runs one variant of the default workflow and records which', async () => {
+		const builtin = BUILTIN_WORKFLOWS.find((w) => w.id === 'dev')!;
+		fake.workflows = {
+			workflows: [
+				{ ...builtin, id: 'dev-a', name: 'Dev A', default: false },
+				{ ...builtin, id: 'dev-b', name: 'Dev B', default: false },
+				{ id: 'ab', name: 'A/B', category: 'dev', default: true, variants: ['dev-a', 'dev-b'] }
+			]
+		};
+		vi.spyOn(Math, 'random').mockReturnValue(0.75);
+		const run = await start();
+		expect(run).toMatchObject({ workflowId: 'dev-b', workflowName: 'Dev B', variantOf: 'ab', phase: 'implement' });
 	});
 });
 

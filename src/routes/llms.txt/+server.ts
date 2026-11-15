@@ -845,7 +845,11 @@ comes, which pauses the clock.
 \`{ "workflows": [<definition>], "problems": ["..."] }\`. Built-ins (\`dev\`,
 \`review\`) merged with \`~/.deck/workflows.json\` (\`{ "workflows": [...] }\`,
 same shape; a matching \`id\` replaces a built-in). Each definition is
-\`{ id, name, category: "dev"|"review", default, steps }\`; each step is
+\`{ id, name, category: "dev"|"review", default, variants?, steps }\`. A
+definition with \`variants: ["<workflow id>", ...]\` (other workflows of its
+category, none with variants of its own) needs no steps: a run started on it
+runs one variant picked uniformly at random, and its digest's \`workflow\`
+names the variant with \`variantOf\` set to the wrapper's id. Each step is
 \`{ id, label, role, skill?, args?, command?, agent?, repeatAgent?,
 escalateAgent?, gate, next, onFail?, retries?, cap? }\`. \`problems\` lists
 user definitions that were skipped as malformed.

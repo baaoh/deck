@@ -136,7 +136,7 @@
 	{#if !loadError}<p class="p-8 text-center opacity-60">Loading…</p>{/if}
 {:else}
 	<div class="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-		<span class="opacity-70">{run.workflow.name}</span>
+		<span class="opacity-70">{run.workflow.name}{run.workflow.variantOf ? ` (variant of ${run.workflow.variantOf})` : ''}</span>
 		<span class="inline-flex items-center gap-1 font-mono opacity-70"><GitBranch size={12} />{run.branch}</span>
 		{#if run.issue}
 			<a class="link link-hover inline-flex items-center gap-1" href={run.issue.url} target="_blank" rel="noreferrer" title={run.issue.id}>

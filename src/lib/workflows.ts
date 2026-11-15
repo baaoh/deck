@@ -89,6 +89,10 @@ export interface WorkflowDef {
 	category: WorkflowCategory;
 	// The one this category fires from the feed automation.
 	default?: boolean;
+	// Other workflows of the same category; a run started on this one runs one
+	// of them, picked uniformly at random, so they can be compared fairly. A
+	// workflow with variants needs no steps of its own.
+	variants?: string[];
 	// The first step is the entry point.
 	steps: WorkflowStep[];
 }
@@ -225,6 +229,8 @@ export interface WorkflowRun {
 	id: string;
 	workflowId: string;
 	workflowName: string;
+	// The workflow the run was started on, when that one picked this variant.
+	variantOf?: string;
 	category: WorkflowCategory;
 	// The definition as it was when the run started, so a removed or renamed
 	// workflow can't break a run that is already going.
@@ -339,7 +345,7 @@ export interface RunPhaseDigest {
 export interface RunDigest {
 	id: string;
 	url: string;
-	workflow: { id: string; name: string; category: WorkflowCategory };
+	workflow: { id: string; name: string; category: WorkflowCategory; variantOf?: string };
 	title: string;
 	projectPath: string;
 	cwd: string;
