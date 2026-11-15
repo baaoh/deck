@@ -108,6 +108,14 @@ export interface Finding {
 	keep?: string;
 }
 
+// One entry of a fix phase's report: the finding, where the change went, and
+// what shows it works.
+export interface FixReport {
+	finding: string;
+	change: string;
+	evidence: string;
+}
+
 // The review's coverage manifest: what it read, and what it skipped (which feeds
 // the next round's scope).
 export interface Coverage {
@@ -215,6 +223,9 @@ export interface WorkflowRun {
 	// computed from the tree (hand edits included), not from the last commit.
 	reviewTree?: string;
 	verifyOutput?: string;
+	// The last fix phase's own report of what it changed and how it checked it.
+	// Best effort: a fix that left no report leaves the previous one.
+	fixes?: FixReport[];
 	disagreement?: string;
 	escalations: { implementer: boolean; disagreement: boolean; cap: boolean };
 	// Per-run model overrides, keyed by step id (an overseer or a person changed one).

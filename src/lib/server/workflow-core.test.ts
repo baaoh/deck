@@ -173,6 +173,7 @@ describe('advance: the dev loop', () => {
 		step(run, red);
 		expect(run.phase).toBe('fix');
 		expect(phasePrompt(run, stepById(run, 'fix')!)).toContain('FAIL src/a.test.ts');
+		expect(phasePrompt(run, stepById(run, 'fix')!)).not.toContain('Open review findings');
 		step(run, ok); // fix -> verify
 		step(run, red);
 		step(run, ok);
@@ -423,6 +424,54 @@ describe('advance: a block result', () => {
 		expect(effect).toEqual({ type: 'block' });
 		expect(run.block).toMatchObject({ step: 'implement', question: 'stop here', kind: 'issue-size' });
 		expect(run.visits[0]).toMatchObject({ result: 'fail', detail: 'stop here' });
+	});
+});
+
+describe('the fix contract', () => {
+	const contract = '{"fixes":[{"finding":"file:line of the finding","change":"file:line you changed","evidence":"test name or command and its result"}]}';
+
+	it('ends every fix prompt with the fixes block, for findings and for red tests', () => {
+		const run = devRun();
+		toReview(run);
+		step(run, review([blocker('src/x.ts')]));
+		const findingsPrompt = phasePrompt(run, stepById(run, 'fix')!);
+		expect(findingsPrompt.endsWith(contract)).toBe(true);
+		expect(findingsPrompt).toContain('Prefer adding a test that fails before your change');
+		run.verifyOutput = 'FAIL src/a.test.ts';
+		expect(phasePrompt(run, stepById(run, 'fix')!).endsWith(contract)).toBe(true);
+	});
+
+	it('hands a red-tests fix the open blockers so it does not undo them', () => {
+		const run = devRun();
+		toReview(run);
+		step(run, review([blocker('src/keep.ts')])); // -> fix
+		step(run, ok); // -> verify
+		step(run, red); // -> fix with the test output
+		const prompt = phasePrompt(run, stepById(run, 'fix')!);
+		expect(prompt).toContain('FAIL src/a.test.ts');
+		expect(prompt).toContain('Open review findings. Do not undo what they asked for:');
+		expect(prompt.indexOf('src/keep.ts')).toBeGreaterThan(prompt.indexOf('Open review findings'));
+	});
+
+	it('stores the fix report, and keeps the disagreements beside it', () => {
+		const run = devRun();
+		toReview(run);
+		step(run, review([blocker()]));
+		const reply = '```json\n{"fixes":[{"finding":"src/a.ts:1","change":"src/a.ts:3","evidence":"a.test.ts passes"}]}\n```';
+		step(run, { pass: true, structured: parseStructured(reply)! });
+		expect(run.fixes).toEqual([{ finding: 'src/a.ts:1', change: 'src/a.ts:3', evidence: 'a.test.ts passes' }]);
+		const both = parseStructured('```json\n{"fixes":"not a list","disagreements":["x vs y"]}\n```');
+		expect(both).toMatchObject({ disagreements: ['x vs y'] });
+		expect(both?.fixes).toBeUndefined();
+	});
+
+	it('is not a failure when the report is missing', () => {
+		const run = devRun();
+		toReview(run);
+		step(run, review([blocker()]));
+		step(run, ok);
+		expect(run.phase).toBe('verify');
+		expect(run.fixes).toBeUndefined();
 	});
 });
 

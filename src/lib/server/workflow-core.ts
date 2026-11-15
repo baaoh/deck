@@ -16,6 +16,7 @@ import {
 	WORKFLOW_CATEGORIES,
 	type Coverage,
 	type Finding,
+	type FixReport,
 	type PhaseStatus,
 	type PhaseVisit,
 	type RunBlockKind,
@@ -376,6 +377,12 @@ const findingSchema = z.object({
 	keep: z.string().optional().catch(undefined)
 });
 
+const fixReportSchema = z.object({
+	finding: z.string().catch(''),
+	change: z.string().catch(''),
+	evidence: z.string().catch('')
+});
+
 const coverageSchema = z.object({
 	examined: z.array(z.string()).catch([]),
 	notExamined: z.array(z.string()).catch([])
@@ -387,6 +394,7 @@ export interface Structured {
 	findings?: Finding[];
 	coverage?: Coverage;
 	disagreements?: string[];
+	fixes?: FixReport[];
 	dismissed?: boolean;
 	reason?: string;
 }
@@ -398,6 +406,8 @@ const structuredSchema = z
 		findings: z.array(findingSchema).optional(),
 		coverage: coverageSchema.optional(),
 		disagreements: z.array(z.string()).optional(),
+		// Never fails the block: a malformed report must not lose the disagreements beside it.
+		fixes: z.array(fixReportSchema).optional().catch(undefined),
 		dismissed: z.boolean().optional(),
 		reason: z.string().optional()
 	})
@@ -564,6 +574,7 @@ function onFollowUp(run: WorkflowRun, step: WorkflowStep, result: GateResult, no
 // A fix that would undo what an earlier round demanded goes to the arbiter once;
 // a second disagreement goes to a person.
 function onFix(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
+	if (result.structured?.fixes?.length) run.fixes = result.structured.fixes;
 	if (run.followUp) return onFollowUp(run, step, result, now);
 	const disagreements = result.structured?.disagreements ?? [];
 	if (!disagreements.length) return passOrFail(run, step, result, now);
@@ -817,7 +828,29 @@ function followUpPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 		`The PR for this work is open: ${run.pr?.url ?? `${run.pr?.repo}#${run.pr?.number}`}. Its review passed, but left these findings:`,
 		asJson(run.findings),
 		"Address each one in the working tree. Treat a suggested fix as a hypothesis: re-derive it from the defect, apply it at the narrowest scope, and keep what each finding's `keep` names. Get the tests green.",
-		`Then make one commit and push it to the PR branch (${run.branch}). Do not open a new PR and do not run a review.`
+		`Then make one commit and push it to the PR branch (${run.branch}). Do not open a new PR and do not run a review.`,
+		FIX_CONTRACT
+	];
+}
+
+// What every fix phase hands back, so the run keeps a record of what changed
+// and what proves it.
+const FIX_CONTRACT = [
+	'For each finding (or each test failure), re-derive it from the code before changing anything. Prefer adding a test that fails before your change and passes after it.',
+	'End your reply with one fenced ```json block, exactly this shape:',
+	'{"fixes":[{"finding":"file:line of the finding","change":"file:line you changed","evidence":"test name or command and its result"}]}'
+].join('\n');
+
+// The red output, and the blockers still open from the last review so a test fix
+// does not quietly undo them.
+function redTestsTask(run: WorkflowRun): string[] {
+	const open = run.findings.filter((f) => f.severity === 'blocker');
+	return [
+		'The tests or typecheck failed. Fix the cause. Output tail:',
+		'```',
+		run.verifyOutput!,
+		'```',
+		...(open.length ? ['Open review findings. Do not undo what they asked for:', asJson(open)] : [])
 	];
 }
 
@@ -825,7 +858,7 @@ function fixPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 	if (run.followUp) return followUpPrompt(run, step);
 	// verifyOutput is set only while verify is red, and cleared when it passes.
 	const task = run.verifyOutput
-		? ['The tests or typecheck failed. Fix the cause. Output tail:', '```', run.verifyOutput!, '```']
+		? redTestsTask(run)
 		: ['Address these review findings in the working tree:', asJson(run.findings.filter((f) => f.severity === 'blocker'))];
 	const earlier = run.pastFindings?.length ? ['Earlier review rounds asked for these, and they were applied:', asJson(run.pastFindings)] : [];
 	return [
@@ -835,7 +868,8 @@ function fixPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 		...earlier,
 		'Treat a suggested fix as a hypothesis: re-derive it from the defect, apply it at the narrowest scope, and keep what each finding\'s `keep` names. Do not commit and do not run a review.',
 		EDIT_TEST_NOTE,
-		'If a finding asks you to undo something an earlier round demanded, do not apply it. List each one in a fenced ```json block: {"disagreements":["finding vs earlier finding, verbatim"]}.'
+		'If a finding asks you to undo something an earlier round demanded, do not apply it. List each one under "disagreements" in the same closing json block: {"fixes":[...],"disagreements":["finding vs earlier finding, verbatim"]}.',
+		FIX_CONTRACT
 	];
 }
 

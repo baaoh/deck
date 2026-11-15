@@ -327,14 +327,15 @@ const GATES: Record<WorkflowStep['gate'], Gate> = {
 
 // A follow-up fix passes on git and the tests, not on what the session says:
 // a new commit on the PR branch, pushed, and green.
-const followUpGate: Gate = async (run) => {
+const followUpGate: Gate = async (run, text) => {
+	const structured = core.parseStructured(text) ?? undefined;
 	const state = await wexec.pushState(run.cwd, run.followUp!.head);
 	const problem = core.followUpProblem(state, run.followUp!.head, run.branch);
-	if (problem) return { pass: false, detail: problem };
+	if (problem) return { pass: false, detail: problem, structured };
 	const command = wexec.verifyCommand(run.cwd, run.steps.find((s) => s.role === 'verify')?.command);
 	const tests = command ? await trackedVerify(run, command) : { code: 0, output: '' };
-	if (tests.code !== 0) return { pass: false, detail: `${command} exited ${tests.code} on the pushed commit` };
-	return { pass: true, detail: state.head.slice(0, 7) };
+	if (tests.code !== 0) return { pass: false, detail: `${command} exited ${tests.code} on the pushed commit`, structured };
+	return { pass: true, detail: state.head.slice(0, 7), structured };
 };
 
 function gateFor(run: WorkflowRun, step: WorkflowStep): Gate {
