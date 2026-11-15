@@ -295,7 +295,11 @@ export interface WorkflowRun {
 	acceptanceOverride?: { at: number; by: DecisionBy; ids: string[] };
 	// Set while a finished run is reopened to fix its leftover findings: the
 	// commit the branch was at, so the gate can tell a new commit was pushed.
-	followUp?: { head: string };
+	// `from` is the post-PR check step that sent the run here, which runs again
+	// once the fix is pushed; absent for a follow-up a person asked for.
+	followUp?: { head: string; from?: string };
+	// Post-PR check steps that already had their one follow-up fix.
+	postPrFixes?: string[];
 	createdAt: number;
 	updatedAt: number;
 }

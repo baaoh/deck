@@ -25,6 +25,7 @@ const fake = vi.hoisted(() => ({
 	// Results for the next verify runs, before falling back to verifyCode.
 	verifyResults: [] as { code: number; output: string; timedOut?: boolean }[],
 	verifyRuns: 0,
+	verifyCommands: [] as string[],
 	// Whether fetchPullRef freshly fetched pr/<n>, and the PR checkouts the runner refreshed.
 	prRefCreated: true,
 	synced: [] as [string, number][],
@@ -126,9 +127,10 @@ vi.mock('./workflow-exec', () => ({
 	pushState: async () => ({ branch: 'acme-web-7', upstreamRef: 'origin/acme-web-7', remote: 'origin', clean: true, descends: true, ...fake.git }),
 	syncPullWorktree: async (cwd: string, n: number) => void fake.synced.push([cwd, n]),
 	toplevel: async (dir: string) => (dir.startsWith('/p/acme/') ? '/p/acme' : dir),
-	verifyCommand: () => 'pnpm test',
-	runVerify: async () => {
+	verifyCommand: (_cwd: string, command?: string) => command ?? 'pnpm test',
+	runVerify: async (_cwd: string, command: string) => {
 		fake.verifyRuns += 1;
+		fake.verifyCommands.push(command);
 		const next = fake.verifyResults.shift();
 		return next ?? { code: fake.verifyCode, output: fake.verifyCode ? 'FAIL' : 'ok' };
 	},
@@ -242,6 +244,7 @@ beforeEach(() => {
 	fake.verifyCode = 0;
 	fake.verifyResults = [];
 	fake.verifyRuns = 0;
+	fake.verifyCommands = [];
 	fake.prRefCreated = true;
 	fake.synced = [];
 	fake.spawnGate = null;
@@ -1036,6 +1039,62 @@ describe('deleting a run', () => {
 
 	it('404s an unknown run', async () => {
 		await expect(runner.deleteRun('r_nope')).rejects.toMatchObject({ status: 404 });
+	});
+});
+
+describe('a post-PR check that fails its gate', () => {
+	const AUDIT = '$HOME/tools/run-audit/run-audit.sh --gate';
+
+	// The built-in dev workflow with an Audit step between the PR and the reviewer loop.
+	function withAudit(): void {
+		const dev = BUILTIN_WORKFLOWS.find((w) => w.id === 'dev')!;
+		const steps = dev.steps.map((s) => (s.role === 'pr' ? { ...s, next: 'audit' } : s));
+		const audit = { id: 'audit', label: 'Audit', role: 'verify', gate: 'exit-zero', command: AUDIT, next: 'feedback', onFail: 'fix' };
+		fake.workflows = { workflows: [{ ...dev, steps: [...steps.slice(0, 7), audit, ...steps.slice(7)] }] };
+	}
+
+	// A run through its PR to the audit, which exits with `code` and prints `output`.
+	async function toAudit(code: number, output: string): Promise<WorkflowRun> {
+		withAudit();
+		fake.verifyResults = [{ code: 0, output: 'ok' }, { code, output }];
+		const run = await start();
+		await finishTurn(run); // -> Tests (0) -> review
+		await finishTurn(run, findings(0)); // -> pr
+		await finishTurn(run); // linked -> audit
+		return run;
+	}
+
+	it('sends unmet items to one follow-up fix on the PR, tested with the Tests command, then audits again', async () => {
+		const run = await toAudit(3, '- A2 counts rows\n- A3 reports timing\n');
+		expect(fake.verifyCommands).toEqual(['pnpm test', AUDIT]);
+		expect(run).toMatchObject({ status: 'running', phase: 'fix', followUp: { head: 'c0', from: 'audit' } });
+		expect(run.findings.map((f) => [f.id, f.severity, f.defect])).toEqual([
+			['F1', 'blocker', 'A2 counts rows'],
+			['F2', 'blocker', 'A3 reports timing']
+		]);
+		expect(promptOf(-1)).toContain('the Audit step found these unmet');
+		expect(promptOf(-1)).toContain('push it to the PR branch');
+
+		fake.git = { head: 'c1', upstream: 'c1' };
+		fake.verifyResults = [{ code: 0, output: 'ok' }, { code: 3, output: '- A3 reports timing' }];
+		await finishTurn(run); // pushed, green on the Tests command -> audit again: still unmet -> next
+		expect(fake.verifyCommands.slice(2)).toEqual(['pnpm test', AUDIT]);
+		expect(run.status).toBe('done');
+		expect(run.decisions.find((d) => d.step === 'audit' && d.action === 'continue')?.reason).toContain('A3 reports timing');
+		expect(run.visits.filter((v) => v.step === 'fix')).toHaveLength(1);
+	});
+
+	it('goes on without a follow-up when the auditor itself fails', async () => {
+		const run = await toAudit(2, 'run-audit: no transcript');
+		expect(run.status).toBe('done');
+		expect(run.followUp).toBeUndefined();
+		expect(run.decisions.at(-1)).toMatchObject({ step: 'audit', action: 'continue', reason: expect.stringContaining('itself failed') });
+	});
+
+	it('goes on when the audit passes', async () => {
+		const run = await toAudit(0, 'all met');
+		expect(run.status).toBe('done');
+		expect(run.visits.filter((v) => v.step === 'fix')).toHaveLength(0);
 	});
 });
 

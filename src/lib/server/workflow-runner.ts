@@ -141,6 +141,15 @@ async function startVerify(run: WorkflowRun, step: WorkflowStep, visit: PhaseVis
 	if (!command) return finish(run, epoch, { pass: true, skipped: true, detail: 'no test command found' });
 	visit.detail = command;
 	commit(run);
+	// A check after the PR reports through its exit code alone: no infrastructure
+	// reruns, and the head a follow-up fix starts from when it asks for one.
+	if (core.isPostPrCheck(run, step)) {
+		const { code, output } = await trackedVerify(run, command);
+		if (stale(run, epoch)) return;
+		const head = code === core.POST_PR_FIX_EXIT ? await wexec.headCommit(run.cwd).catch(() => undefined) : undefined;
+		if (stale(run, epoch)) return;
+		return finish(run, epoch, { pass: code === 0, detail: `${command} exited ${code}`, output, code, head });
+	}
 	// An infrastructure failure (a kill, out of memory, a timeout) says nothing
 	// about the code: run the same tree again rather than starting a fix, and
 	// leave the red count alone.
@@ -354,6 +363,7 @@ const followUpGate: Gate = async (run, text) => {
 	const state = await wexec.pushState(run.cwd, run.followUp!.head);
 	const problem = core.followUpProblem(state, run.followUp!.head, run.branch);
 	if (problem) return { pass: false, detail: problem, structured };
+	// The first verify step is the Tests step; a post-PR check is a verify step too.
 	const command = wexec.verifyCommand(run.cwd, run.steps.find((s) => s.role === 'verify')?.command);
 	const tests = command ? await trackedVerify(run, command) : { code: 0, output: '' };
 	if (tests.code !== 0) return { pass: false, detail: `${command} exited ${tests.code} on the pushed commit`, structured };

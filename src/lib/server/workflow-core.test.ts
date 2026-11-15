@@ -28,6 +28,8 @@ import {
 	pickWorkflow,
 	resolveWorkflows,
 	resolveVariant,
+	checkItems,
+	isPostPrCheck,
 	reviewedAtHead,
 	runDigest,
 	unchangedReviewReason,
@@ -801,6 +803,61 @@ describe('the acceptance checklist', () => {
 		expect(acceptOverride(run, NOW)).toEqual({ type: 'enter', step: 'feedback' });
 		expect(run.decisions.at(-1)).toMatchObject({ step: 'pr', action: 'accept-unmet', reason: expect.stringContaining('A2') });
 		expect(runDigest(run, 'http://x').acceptance).toHaveLength(3);
+	});
+});
+
+describe('post-PR checks', () => {
+	// A dev run whose definition has an Audit step after the PR, walked through
+	// a passing PR step.
+	function auditedRun(): WorkflowRun {
+		const run = devRun();
+		const audit = { id: 'audit', label: 'Audit', role: 'verify' as const, gate: 'exit-zero' as const, command: 'audit.sh', next: 'feedback', onFail: 'fix' };
+		run.steps = [...run.steps.map((s) => (s.role === 'pr' ? { ...s, next: 'audit' } : s)), audit];
+		toReview(run);
+		step(run, review([]));
+		run.pr = { repo: 'acme/web', number: 9 };
+		step(run, ok); // pr -> audit
+		return run;
+	}
+	const gateFail = (output: string, code = 3): GateResult => ({ pass: false, code, output, head: 'c0' });
+
+	it('is only a verify step after a passed PR step whose onFail is a fix', () => {
+		const run = auditedRun();
+		expect(run.phase).toBe('audit');
+		expect(isPostPrCheck(run, stepById(run, 'audit')!)).toBe(true);
+		expect(isPostPrCheck(run, stepById(run, 'verify')!)).toBe(false);
+		const early = devRun();
+		early.steps = auditedRun().steps;
+		expect(isPostPrCheck(early, stepById(early, 'audit')!)).toBe(false);
+	});
+
+	it('turns the printed items into blockers with ids and enters the follow-up once', () => {
+		const run = auditedRun();
+		run.findings = [{ id: 'F1', file: 'src/a.ts', severity: 'nit', defect: 'old nit' }];
+		expect(step(run, gateFail('1. A1 exports CSV\n\n* A2 counts rows'))).toEqual({ type: 'enter', step: 'fix' });
+		expect(run.findings).toMatchObject([
+			{ id: 'F2', severity: 'blocker', defect: 'A1 exports CSV' },
+			{ id: 'F3', severity: 'blocker', defect: 'A2 counts rows' }
+		]);
+		expect(run.followUp).toEqual({ head: 'c0', from: 'audit' });
+		expect(run.verifyOutput).toBeUndefined();
+		expect(step(run, { pass: true, detail: 'c1' })).toEqual({ type: 'enter', step: 'audit' });
+		expect(run.followUp).toBeUndefined();
+		expect(step(run, gateFail('A2 counts rows'))).toEqual({ type: 'enter', step: 'feedback' });
+		expect(run.decisions.at(-1)).toMatchObject({ action: 'continue', reason: expect.stringContaining('after its follow-up fix: A2 counts rows') });
+	});
+
+	it('never follows up on another exit code', () => {
+		const run = auditedRun();
+		expect(step(run, gateFail('crashed', 1))).toEqual({ type: 'enter', step: 'feedback' });
+		expect(run.followUp).toBeUndefined();
+		expect(run.postPrFixes).toBeUndefined();
+	});
+
+	it('keeps the last items of a long output', () => {
+		const items = checkItems(Array.from({ length: 30 }, (_, i) => `- item ${i}`).join('\n'));
+		expect(items).toHaveLength(20);
+		expect(items[0]).toBe('item 10');
 	});
 });
 

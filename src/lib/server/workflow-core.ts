@@ -546,6 +546,9 @@ export interface GateResult {
 	output?: string;
 	// The step found a reason to stop for a person: no retry, no failure path.
 	block?: { question: string; kind?: RunBlockKind };
+	// A post-PR check's exit code, and the branch head when it asks for a fix.
+	code?: number;
+	head?: string;
 }
 
 // What the runner must do next.
@@ -602,6 +605,7 @@ function onVerify(run: WorkflowRun, step: WorkflowStep, result: GateResult, now:
 		run.failures[key] = 0;
 		return goTo(run, step.next, now);
 	}
+	if (isPostPrCheck(run, step)) return onPostPrCheck(run, step, result, now);
 	run.verifyOutput = result.output;
 	run.failures[key] = (run.failures[key] ?? 0) + 1;
 	if (run.failures[key] >= VERIFY_RED_CAP) {
@@ -860,13 +864,65 @@ function onReview(run: WorkflowRun, step: WorkflowStep, result: GateResult, now:
 	return failTo(run, step, `${blockers} blockers.`, now);
 }
 
-// A follow-up fix ends the run again once its commit is pushed.
+// A follow-up fix ends the run again once its commit is pushed, or, when a
+// post-PR check asked for it, runs that check again.
 function onFollowUp(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
 	if (!result.pass) return blockRun(run, step.id, `The follow-up fix did not land: ${result.detail ?? 'no pushed commit'}`, now);
 	decide(run, step.id, 'follow-up', `Leftover findings addressed in ${result.detail ?? 'a pushed commit'}.`, now);
+	const from = run.followUp?.from;
 	run.followUp = undefined;
 	run.findings = [];
-	return goTo(run, DONE, now);
+	return goTo(run, from && stepById(run, from) ? from : DONE, now);
+}
+
+// ---- Post-PR checks ----
+
+// The exit code a post-PR check (an outside audit run with --gate) uses to say
+// it found unmet items. Any other failure is the check itself breaking.
+export const POST_PR_FIX_EXIT = 3;
+const POST_PR_ITEM_CAP = 20;
+
+// A verify step placed after the PR step, once the PR is up, whose onFail
+// names a fix step: its gate failure becomes a follow-up fix on the open PR
+// instead of a fix in the dev loop.
+export function isPostPrCheck(run: WorkflowRun, step: WorkflowStep): boolean {
+	if (step.role !== 'verify' || !step.onFail || stepById(run, step.onFail)?.role !== 'fix') return false;
+	const pr = stepWithRole(run, 'pr');
+	if (!pr || !run.pr || run.steps.indexOf(step) < run.steps.indexOf(pr)) return false;
+	return visitsOf(run, pr.id).some((v) => v.result === 'pass');
+}
+
+// The items a failed check printed, one per non-empty line, without list
+// markers. The last ones are kept when there are too many.
+export function checkItems(output: string): string[] {
+	return output
+		.split('\n')
+		.map((l) => l.trim().replace(LIST_ITEM, '').trim())
+		.filter(Boolean)
+		.slice(-POST_PR_ITEM_CAP);
+}
+
+// One follow-up fix per check step: the printed items become blockers under
+// new finding ids. The check failing itself (another exit code), failing again
+// after its follow-up, or a branch head that could not be read goes on to the
+// step's `next` with a decision saying what was left.
+function onPostPrCheck(run: WorkflowRun, step: WorkflowStep, result: GateResult, now: number): Effect {
+	const goOn = (reason: string) => {
+		decide(run, step.id, 'continue', reason, now);
+		return goTo(run, step.next, now);
+	};
+	if (result.code !== POST_PR_FIX_EXIT) return goOn(`${step.label} itself failed (${result.detail ?? 'no exit code'}); going on without a follow-up fix.`);
+	const items = checkItems(result.output ?? '');
+	const listed = items.length ? items.join('; ') : 'no items printed';
+	if (run.postPrFixes?.includes(step.id)) return goOn(`${step.label} still reports unmet items after its follow-up fix: ${listed}`);
+	if (!result.head) return goOn(`${step.label} reported unmet items, but the branch head could not be read for a follow-up fix: ${listed}`);
+	run.postPrFixes = [...(run.postPrFixes ?? []), step.id];
+	const defects = items.length ? items : [`${step.label} exited ${POST_PR_FIX_EXIT} without naming the unmet items; rerun it to see them.`];
+	run.findings = defects.map((defect) => ({ id: nextFindingId(run), file: 'acceptance', severity: 'blocker', defect }));
+	run.followUp = { head: result.head, from: step.id };
+	run.failures[step.onFail!] = 0;
+	decide(run, step.id, 'follow-up', `${step.label} found ${defects.length} unmet items; one follow-up fix on the PR branch.`, now);
+	return goTo(run, step.onFail!, now);
 }
 
 // A fix that would undo what an earlier round demanded goes to the arbiter once;
@@ -1288,13 +1344,18 @@ function reviewPrompt(run: WorkflowRun, step: WorkflowStep, ctx: PromptContext):
 	];
 }
 
+function followUpCause(run: WorkflowRun): string {
+	const from = run.followUp?.from ? stepById(run, run.followUp.from) : undefined;
+	return from ? `After it opened, the ${from.label} step found these unmet:` : 'Its review passed, but left these findings:';
+}
+
 // A finished run reopened to clear what the review let through. The PR is
 // already open, so this session commits and pushes to it itself.
 function followUpPrompt(run: WorkflowRun, step: WorkflowStep): string[] {
 	return [
 		skillLine(step, issueRef(run)),
 		PHASE_NOTE,
-		`The PR for this work is open: ${run.pr?.url ?? `${run.pr?.repo}#${run.pr?.number}`}. Its review passed, but left these findings:`,
+		`The PR for this work is open: ${run.pr?.url ?? `${run.pr?.repo}#${run.pr?.number}`}. ${followUpCause(run)}`,
 		asJson(run.findings),
 		"Address each one in the working tree. Treat a suggested fix as a hypothesis: re-derive it from the defect, apply it at the narrowest scope, and keep what each finding's `keep` names. Get the tests green.",
 		`Then make one commit and push it to the PR branch (${run.branch}). Do not open a new PR and do not run a review.`,
