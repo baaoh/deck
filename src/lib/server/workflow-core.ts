@@ -636,6 +636,18 @@ export function advance(run: WorkflowRun, result: GateResult, now: number): Effe
 	return (HANDLERS[step.role] ?? passOrFail)(run, step, result, now);
 }
 
+// ---- How a phase ended ----
+
+export const USAGE_LIMIT_BLOCK = 'agent hit its usage limit; resume when it resets';
+
+const USAGE_LIMIT = /usage limit|limit reached|hit your (?:\w+ )?limit|rate[ _-]?limit|quota|too many requests|\b429\b/i;
+
+// Whether a turn's error text (see lastTurnErrors) says the agent ran out of its
+// account's usage or was rate limited: waiting fixes that, a retry does not.
+export function usageLimitHit(errors: string): boolean {
+	return USAGE_LIMIT.test(errors);
+}
+
 // ---- Before a review round ----
 
 // The visit before the current one, skipping verify, came from the fix step.

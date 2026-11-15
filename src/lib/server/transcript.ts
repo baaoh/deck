@@ -3,7 +3,7 @@ import path from 'node:path';
 import { transcriptsDir } from './config';
 import { emptyCostSummary, foldResult, type CostSummary } from '$lib/session-cost-core';
 import { emptyContext, foldContext, type ContextUsage } from '$lib/context-core';
-import { projectTranscript, type TranscriptMessage } from '$lib/agent-transcript-core';
+import { lastTurnErrors, projectTranscript, type TranscriptMessage } from '$lib/agent-transcript-core';
 import { isAskTool } from '$lib/transcript-groups';
 import { emptyAgents, foldAgents, mayAffectAgents, runningAgents, stopAll, withoutOldReports, type AgentsState } from '$lib/subagents-core';
 import { whenDrained } from './transcript-writer';
@@ -214,6 +214,11 @@ export function readTranscriptTailText(id: string): string {
 // single-session digest's `lastResult` (issue #144).
 export function sessionLastResult(id: string): string | null {
 	return projectTranscript(readTranscriptTail(id).events).lastResult;
+}
+
+// The error text the session's last turn ended with, empty when it ended clean.
+export function sessionTurnErrors(id: string): string {
+	return lastTurnErrors(readTranscriptTail(id).events);
 }
 
 // Readable, projected turn output for the agent transcript endpoint (issue #144):

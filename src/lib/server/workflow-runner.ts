@@ -17,7 +17,7 @@ import { agentFields } from './automation-core';
 import { agentInterrupt, agentSend, agentTurnRunning } from './agents/dispatch';
 import { getStoredSession, listProjects, listStoredSessions, updateSession } from './store';
 import { hasPendingAsk } from './ask';
-import { sessionLastResult } from './transcript';
+import { sessionLastResult, sessionTurnErrors } from './transcript';
 import { notify } from './push';
 import { createWorktree, fetchPullRef, originRepo } from './git';
 import { projectForPath, resolveWithinProjects } from './confine';
@@ -331,6 +331,8 @@ function gateFor(run: WorkflowRun, step: WorkflowStep): Gate {
 }
 
 async function evaluate(run: WorkflowRun, step: WorkflowStep, sessionId: string, subtype: string): Promise<core.GateResult> {
+	// Not the phase's failure: a retry would hit the same limit, so wait for a person.
+	if (core.usageLimitHit(sessionTurnErrors(sessionId))) return { pass: false, block: { question: core.USAGE_LIMIT_BLOCK } };
 	if (subtype === 'error') return { pass: false, error: 'the session errored' };
 	if (subtype !== 'success') return { pass: false, error: `the turn ended with ${subtype}` };
 	try {

@@ -11,6 +11,7 @@ const fake = vi.hoisted(() => ({
 	sessions: new Map<string, DeckSession>(),
 	created: [] as Record<string, unknown>[],
 	lastResult: new Map<string, string>(),
+	turnErrors: new Map<string, string>(),
 	sent: [] as { id: string; text: string }[],
 	interrupted: [] as string[],
 	notified: [] as Record<string, unknown>[],
@@ -81,7 +82,8 @@ vi.mock('./agents/dispatch', () => ({
 }));
 vi.mock('./ask', () => ({ hasPendingAsk: () => false }));
 vi.mock('./transcript', () => ({
-	sessionLastResult: (id: string) => fake.lastResult.get(id) ?? null
+	sessionLastResult: (id: string) => fake.lastResult.get(id) ?? null,
+	sessionTurnErrors: (id: string) => fake.turnErrors.get(id) ?? ''
 }));
 vi.mock('./push', () => ({
 	notify: (p: Record<string, unknown>) => void fake.notified.push(p)
@@ -216,6 +218,7 @@ beforeEach(() => {
 	fake.sessions.clear();
 	fake.created = [];
 	fake.lastResult.clear();
+	fake.turnErrors.clear();
 	fake.sent = [];
 	fake.interrupted = [];
 	fake.notified = [];
@@ -333,6 +336,22 @@ describe('no review of an unchanged tree', () => {
 		expect(run.status).toBe('running');
 		expect(run.phase).toBe('review');
 		expect(fake.created).toHaveLength(4);
+	});
+});
+
+describe('a usage limit', () => {
+	it('blocks the run instead of failing or retrying the phase', async () => {
+		const run = await start();
+		fake.turnErrors.set('s1', 'Claude AI usage limit reached|1700000000');
+		await finishTurn(run, 'Claude AI usage limit reached');
+		expect(run.status).toBe('blocked');
+		expect(run.block).toMatchObject({ step: 'implement', question: 'agent hit its usage limit; resume when it resets' });
+		expect(run.failures.implement ?? 0).toBe(0);
+		expect(fake.created).toHaveLength(1);
+		await runner.runAction(run.id, 'resume', {});
+		await settle();
+		expect(run.status).toBe('running');
+		expect(fake.created).toHaveLength(2);
 	});
 });
 

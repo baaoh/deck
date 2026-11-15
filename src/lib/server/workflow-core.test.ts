@@ -23,6 +23,7 @@ import {
 	reviewedAtHead,
 	runDigest,
 	unchangedReviewReason,
+	usageLimitHit,
 	stepById,
 	type GateResult,
 	type PrReviewView
@@ -348,6 +349,28 @@ describe('phase prompts', () => {
 	it('invokes the skill named by the step', () => {
 		const run = devRun();
 		expect(phasePrompt(run, stepById(run, 'implement')!).startsWith('/dev-workflow https://github.com/acme/web/issues/1')).toBe(true);
+	});
+});
+
+describe('usageLimitHit', () => {
+	it('recognises claude and codex usage and rate limits', () => {
+		for (const text of [
+			'Claude AI usage limit reached|1700000000',
+			"You've hit your session limit · resets 3pm",
+			'5-hour limit reached ∙ resets 2am',
+			'rate_limit',
+			'API Error: 429 {"type":"error"}',
+			'You exceeded your current quota, please check your plan',
+			'stream error: Rate limit exceeded'
+		]) {
+			expect(usageLimitHit(text), text).toBe(true);
+		}
+	});
+
+	it('leaves other failures to the normal retry', () => {
+		expect(usageLimitHit('')).toBe(false);
+		expect(usageLimitHit('codex turn failed: sandbox denied')).toBe(false);
+		expect(usageLimitHit('API Error: 500 overloaded')).toBe(false);
 	});
 });
 

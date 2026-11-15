@@ -74,3 +74,24 @@ export function projectTranscript(events: unknown[]): ProjectedTranscript {
 	}
 	return { messages: messages.slice(-MAX_MESSAGES), lastResult };
 }
+
+type TurnEvent = { type?: unknown; text?: unknown; subtype?: unknown; is_error?: unknown; result?: unknown; error?: unknown; message?: { content?: unknown } };
+
+// The error text a session's last turn ended with: deck.error lines (how codex
+// and the per-turn runners report a failure), an errored result footer's text
+// (claude's `is_error` result), and an assistant message flagged as an API
+// error. Empty when the turn ended with a clean result: an agent may log an
+// error mid-turn (a retried 429) and still finish its work.
+export function lastTurnErrors(events: unknown[]): string {
+	const start = events.findLastIndex((e) => (e as TurnEvent)?.type === 'deck.user');
+	const turn = events.slice(start + 1) as (TurnEvent | null)[];
+	const end = turn.findLast((e) => e?.type === 'result');
+	if (end && end.is_error !== true && (end.subtype ?? 'success') === 'success') return '';
+	const parts: string[] = [];
+	for (const e of turn) {
+		if (e?.type === 'deck.error' && typeof e.text === 'string') parts.push(e.text);
+		else if (e?.type === 'result' && typeof e.result === 'string') parts.push(e.result);
+		else if (e?.type === 'assistant' && e.error) parts.push(String(e.error), textFromContent(e.message?.content));
+	}
+	return parts.filter(Boolean).join('\n');
+}
